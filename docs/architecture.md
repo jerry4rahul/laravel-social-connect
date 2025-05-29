@@ -1,387 +1,87 @@
-# Package Architecture and Database Schema
+# Package Architecture and Design (Stateless Refactor)
 
-This document outlines the architecture and database schema for the Laravel Social Connect package.
+This document outlines the refactored architecture for the Laravel Social Connect package, designed for stateless operation where the consuming application manages all data persistence.
 
-## Package Structure
+## Core Principles
+
+1.  **Stateless Services**: The package services will not maintain any internal state related to specific users or accounts between requests. All necessary information (like API tokens) must be provided for each operation.
+2.  **No Internal Persistence**: The package will **not** include any database migrations or Eloquent models. It will not store tokens, user data, posts, metrics, messages, or comments.
+3.  **User-Managed Data**: The consuming Laravel application is responsible for:
+    *   Storing and retrieving API credentials (access tokens, refresh tokens, etc.) for each connected social account.
+    *   Storing any data returned by the package services (e.g., published post IDs, metrics results, message content, comment details) in their own database schema or data structures.
+4.  **Data Transfer Objects (DTOs) / Arrays**: Services will return data primarily as structured PHP arrays or potentially simple Data Transfer Objects (DTOs) for clarity, rather than Eloquent models.
+
+## Directory Structure (Conceptual)
 
 ```
 laravel-social-connect/
 ├── config/
-│   └── social-connect.php       # Configuration file
-├── database/
-│   └── migrations/              # Database migrations
-├── resources/
-│   ├── views/                   # Blade views for dashboard
-│   └── assets/                  # CSS, JS assets
-├── routes/
-│   └── web.php                  # Package routes
+│   └── social-connect.php      # Configuration (API keys, redirect URIs, etc.)
 ├── src/
-│   ├── Console/                 # Console commands
-│   ├── Contracts/               # Interfaces
-│   ├── Events/                  # Events
-│   ├── Exceptions/              # Custom exceptions
-│   ├── Facades/                 # Facade classes
-│   ├── Http/                    # HTTP controllers, middleware
-│   ├── Jobs/                    # Queue jobs
-│   ├── Models/                  # Eloquent models
-│   ├── Providers/               # Service providers
-│   ├── Services/                # Service classes
-│   │   ├── Facebook/            # Facebook-specific services
-│   │   ├── Instagram/           # Instagram-specific services
-│   │   ├── Twitter/             # Twitter-specific services
-│   │   ├── LinkedIn/            # LinkedIn-specific services
-│   │   ├── YouTube/             # YouTube-specific services
-│   │   └── Common/              # Shared services
-│   └── SocialConnectManager.php # Main package class
-└── tests/                       # Test files
+│   ├── Contracts/              # Interfaces for services
+│   │   ├── SocialPlatformInterface.php
+│   │   ├── PublishableInterface.php
+│   │   ├── MetricsInterface.php
+│   │   ├── MessagingInterface.php
+│   │   └── CommentManagementInterface.php
+│   ├── DTOs/                   # (Optional) Data Transfer Objects for returned data
+│   ├── Exceptions/             # Custom exceptions
+│   ├── Facades/                # Laravel Facade
+│   │   └── SocialConnect.php
+│   ├── Services/               # Platform-specific service implementations
+│   │   ├── Facebook/
+│   │   ├── Instagram/
+│   │   ├── Twitter/
+│   │   ├── LinkedIn/
+│   │   └── YouTube/
+│   ├── SocialConnectManager.php  # Main manager class
+│   └── SocialConnectServiceProvider.php # Service provider
+├── routes/
+│   └── web.php                 # Routes for OAuth callbacks (optional, user can define)
+├── resources/
+│   └── views/                  # Optional views for OAuth flow examples
+├── tests/                      # Unit and Feature tests
+├── README.md
+├── LICENSE.md
+└── composer.json
 ```
 
-## Core Components
+**Key Changes:**
 
-### 1. SocialConnectManager
+*   `database/migrations` directory is removed.
+*   `src/Models` directory is removed.
+*   Services in `src/Services/` will be refactored.
 
-The main entry point for the package, responsible for:
-- Managing platform connections
-- Providing a unified interface for all platforms
-- Handling authentication flows
-- Dispatching operations to platform-specific services
+## Service Interaction Flow
 
-### 2. Platform Services
+1.  **Configuration**: The user configures platform API keys and redirect URIs in `config/social-connect.php` (published from the package).
+2.  **Authentication**: 
+    *   The package provides methods to generate the OAuth redirect URL (`SocialConnect::platform("facebook")->getRedirectUrl()`).
+    *   The user redirects their application user to this URL.
+    *   Upon callback, the package provides a method to exchange the authorization code for tokens (`SocialConnect::platform("facebook")->exchangeCodeForToken($code)`). This method returns the access token, refresh token (if applicable), expiry time, and basic user/profile info (ID, name, email).
+    *   **The user's application is responsible for securely storing these tokens** (e.g., in their `users` table or a dedicated `social_tokens` table).
+3.  **API Calls (Publishing, Metrics, etc.)**: 
+    *   When the user wants to perform an action (e.g., publish a post), they retrieve the stored access token for the relevant platform and user.
+    *   They instantiate the appropriate service via the `SocialConnectManager`, passing the **access token** and any other required identifiers (like the platform user ID or page ID if needed).
+    *   Example: `SocialConnect::publisher("facebook", $accessToken, $pageId)->publishText("Hello")`
+    *   The service method performs the API call using the provided token.
+    *   The service returns the result (e.g., the platform's post ID, metrics data as an array, list of messages as an array) directly to the user's application.
+    *   **The user's application decides how and where to store this returned data.**
 
-Each platform (Facebook, Instagram, Twitter, LinkedIn, YouTube) will have dedicated service classes for:
-- Authentication and token management
-- Post publishing
-- Metrics retrieval
-- DM/message management
-- Comment and interaction management
+## Data Structures
 
-### 3. Models
+*   **Tokens**: Methods handling token exchange will return an array or DTO containing `access_token`, `refresh_token`, `expires_in`, `platform_user_id`, `name`, `email`, etc.
+*   **Returned Data**: Methods for publishing, metrics, messaging, comments will return structured arrays or DTOs representing the result (e.g., `["platform_post_id" => "12345"]`, `["followers" => 1000, "engagement" => 0.05]`, array of message objects/arrays).
 
-Eloquent models representing the database entities:
-- SocialAccount
-- SocialPost
-- SocialMetric
-- SocialMessage
-- SocialComment
-- SocialInteraction
+## Token Management
 
-### 4. Contracts (Interfaces)
+*   The package **will not** handle token storage or automatic refresh.
+*   The user's application must implement logic to:
+    *   Store tokens securely.
+    *   Check token expiry before making API calls.
+    *   Use the refresh token (if available) to obtain a new access token when needed (the package might provide a helper method like `SocialConnect::platform("facebook")->refreshToken($refreshToken)`).
+    *   Update the stored tokens after a refresh.
 
-Interfaces defining the required methods for each service type:
-- SocialPlatformInterface
-- PublishableInterface
-- MetricsInterface
-- MessagingInterface
-- CommentableInterface
+## Conclusion
 
-## Database Schema
-
-### social_accounts
-
-Stores connected social media accounts:
-
-```
-CREATE TABLE social_accounts (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
-    platform VARCHAR(20) NOT NULL, -- facebook, instagram, twitter, linkedin, youtube
-    platform_id VARCHAR(255) NOT NULL, -- ID on the platform
-    name VARCHAR(255) NOT NULL,
-    username VARCHAR(255),
-    email VARCHAR(255),
-    avatar VARCHAR(255),
-    access_token TEXT NOT NULL,
-    refresh_token TEXT,
-    token_expires_at TIMESTAMP NULL,
-    scopes JSON,
-    metadata JSON,
-    created_at TIMESTAMP NULL,
-    updated_at TIMESTAMP NULL,
-    UNIQUE(user_id, platform, platform_id),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-```
-
-### social_posts
-
-Stores posts published through the package:
-
-```
-CREATE TABLE social_posts (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
-    social_account_id BIGINT UNSIGNED NOT NULL,
-    platform VARCHAR(20) NOT NULL,
-    platform_post_id VARCHAR(255) NOT NULL,
-    content TEXT,
-    media_urls JSON,
-    post_type VARCHAR(50) NOT NULL, -- text, image, video, link, etc.
-    post_url VARCHAR(255),
-    scheduled_at TIMESTAMP NULL,
-    published_at TIMESTAMP NULL,
-    status VARCHAR(20) NOT NULL, -- draft, scheduled, published, failed
-    metadata JSON,
-    created_at TIMESTAMP NULL,
-    updated_at TIMESTAMP NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (social_account_id) REFERENCES social_accounts(id) ON DELETE CASCADE
-);
-```
-
-### social_metrics
-
-Stores metrics and insights for accounts and posts:
-
-```
-CREATE TABLE social_metrics (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
-    social_account_id BIGINT UNSIGNED NULL,
-    social_post_id BIGINT UNSIGNED NULL,
-    metric_type VARCHAR(50) NOT NULL, -- impression, reach, engagement, etc.
-    metric_value JSON NOT NULL, -- can store complex metrics data
-    period_start TIMESTAMP NULL,
-    period_end TIMESTAMP NULL,
-    created_at TIMESTAMP NULL,
-    updated_at TIMESTAMP NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (social_account_id) REFERENCES social_accounts(id) ON DELETE SET NULL,
-    FOREIGN KEY (social_post_id) REFERENCES social_posts(id) ON DELETE SET NULL
-);
-```
-
-### social_messages
-
-Stores direct messages:
-
-```
-CREATE TABLE social_messages (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
-    social_account_id BIGINT UNSIGNED NOT NULL,
-    conversation_id VARCHAR(255) NOT NULL,
-    platform_message_id VARCHAR(255) NOT NULL,
-    sender_id VARCHAR(255) NOT NULL,
-    sender_name VARCHAR(255),
-    recipient_id VARCHAR(255) NOT NULL,
-    recipient_name VARCHAR(255),
-    content TEXT NOT NULL,
-    attachments JSON,
-    is_read BOOLEAN DEFAULT FALSE,
-    sent_at TIMESTAMP NULL,
-    created_at TIMESTAMP NULL,
-    updated_at TIMESTAMP NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (social_account_id) REFERENCES social_accounts(id) ON DELETE CASCADE
-);
-```
-
-### social_comments
-
-Stores comments on posts:
-
-```
-CREATE TABLE social_comments (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
-    social_account_id BIGINT UNSIGNED NOT NULL,
-    social_post_id BIGINT UNSIGNED NULL,
-    platform_comment_id VARCHAR(255) NOT NULL,
-    platform_post_id VARCHAR(255) NOT NULL,
-    parent_comment_id BIGINT UNSIGNED NULL,
-    commenter_id VARCHAR(255),
-    commenter_name VARCHAR(255),
-    commenter_username VARCHAR(255),
-    content TEXT NOT NULL,
-    attachments JSON,
-    is_hidden BOOLEAN DEFAULT FALSE,
-    commented_at TIMESTAMP NULL,
-    created_at TIMESTAMP NULL,
-    updated_at TIMESTAMP NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (social_account_id) REFERENCES social_accounts(id) ON DELETE CASCADE,
-    FOREIGN KEY (social_post_id) REFERENCES social_posts(id) ON DELETE SET NULL,
-    FOREIGN KEY (parent_comment_id) REFERENCES social_comments(id) ON DELETE SET NULL
-);
-```
-
-### social_interactions
-
-Stores likes, shares, and other interactions:
-
-```
-CREATE TABLE social_interactions (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id BIGINT UNSIGNED NOT NULL,
-    social_account_id BIGINT UNSIGNED NOT NULL,
-    social_post_id BIGINT UNSIGNED NULL,
-    social_comment_id BIGINT UNSIGNED NULL,
-    interaction_type VARCHAR(50) NOT NULL, -- like, share, retweet, etc.
-    platform_interaction_id VARCHAR(255),
-    interactor_id VARCHAR(255),
-    interactor_name VARCHAR(255),
-    interactor_username VARCHAR(255),
-    metadata JSON,
-    interacted_at TIMESTAMP NULL,
-    created_at TIMESTAMP NULL,
-    updated_at TIMESTAMP NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (social_account_id) REFERENCES social_accounts(id) ON DELETE CASCADE,
-    FOREIGN KEY (social_post_id) REFERENCES social_posts(id) ON DELETE SET NULL,
-    FOREIGN KEY (social_comment_id) REFERENCES social_comments(id) ON DELETE SET NULL
-);
-```
-
-## Authentication Flow
-
-1. User initiates connection to a social platform
-2. Package redirects to platform's OAuth authorization page
-3. User grants permissions to our application
-4. Platform redirects back with authorization code
-5. Package exchanges code for access token
-6. Access token is stored in `social_accounts` table
-7. Refresh token flow is implemented where applicable
-8. Token validation and expiration handling
-
-## Key Features Implementation
-
-### 1. Account Connection
-
-- OAuth-based authentication for all platforms
-- Token storage and management
-- Account metadata retrieval and storage
-
-### 2. Post Publishing
-
-- Text, image, video, and link post support
-- Cross-platform publishing
-- Scheduled posting
-- Draft management
-
-### 3. Metrics Retrieval
-
-- Account-level metrics (followers, engagement, etc.)
-- Post-level metrics (impressions, likes, shares, etc.)
-- Historical data and trends
-- Exportable reports
-
-### 4. DM Management
-
-- Conversation listing
-- Message sending and receiving
-- Attachment support
-- Read status tracking
-
-### 5. Comment Management
-
-- Comment retrieval and display
-- Comment posting and replying
-- Comment moderation (hide, delete)
-- Sentiment analysis (optional)
-
-## Configuration Options
-
-The `config/social-connect.php` file will include:
-
-```php
-return [
-    // API credentials
-    'credentials' => [
-        'facebook' => [
-            'client_id' => env('FACEBOOK_CLIENT_ID'),
-            'client_secret' => env('FACEBOOK_CLIENT_SECRET'),
-            'redirect' => env('FACEBOOK_REDIRECT_URI'),
-        ],
-        'instagram' => [
-            'client_id' => env('INSTAGRAM_CLIENT_ID'),
-            'client_secret' => env('INSTAGRAM_CLIENT_SECRET'),
-            'redirect' => env('INSTAGRAM_REDIRECT_URI'),
-        ],
-        // Similar for other platforms
-    ],
-    
-    // Feature toggles
-    'features' => [
-        'publishing' => true,
-        'metrics' => true,
-        'messaging' => true,
-        'comments' => true,
-    ],
-    
-    // Cache settings
-    'cache' => [
-        'enabled' => true,
-        'duration' => 60, // minutes
-    ],
-    
-    // Rate limiting
-    'rate_limits' => [
-        'facebook' => [
-            'calls_per_hour' => 200,
-        ],
-        // Similar for other platforms
-    ],
-    
-    // Webhook settings
-    'webhooks' => [
-        'enabled' => false,
-        'secret' => env('SOCIAL_CONNECT_WEBHOOK_SECRET'),
-        'routes' => [
-            'facebook' => 'social-connect/webhook/facebook',
-            // Similar for other platforms
-        ],
-    ],
-];
-```
-
-## Service Provider Registration
-
-The package will register its service provider in the Laravel application:
-
-```php
-// In config/app.php
-'providers' => [
-    // Other providers
-    VendorName\SocialConnect\SocialConnectServiceProvider::class,
-],
-
-'aliases' => [
-    // Other aliases
-    'SocialConnect' => VendorName\SocialConnect\Facades\SocialConnect::class,
-],
-```
-
-## Facade Usage Example
-
-```php
-// Connect to a platform
-SocialConnect::connect('facebook');
-
-// Publish a post
-SocialConnect::platform('facebook')
-    ->account($accountId)
-    ->publish([
-        'content' => 'Hello world!',
-        'media' => ['image.jpg'],
-    ]);
-
-// Get metrics
-$metrics = SocialConnect::platform('instagram')
-    ->account($accountId)
-    ->metrics()
-    ->period('last_30_days')
-    ->get();
-
-// Get messages
-$messages = SocialConnect::platform('twitter')
-    ->account($accountId)
-    ->messages()
-    ->conversation($conversationId)
-    ->get();
-
-// Reply to a comment
-SocialConnect::platform('youtube')
-    ->account($accountId)
-    ->comments()
-    ->reply($commentId, 'Thank you for your feedback!');
-```
+This stateless architecture provides maximum flexibility for developers to integrate social media functionalities into their Laravel applications without imposing a specific database structure. It shifts the responsibility of data persistence entirely to the consuming application.

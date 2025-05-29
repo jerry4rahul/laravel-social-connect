@@ -3,179 +3,114 @@
 namespace VendorName\SocialConnect;
 
 use Illuminate\Support\ServiceProvider;
-use VendorName\SocialConnect\Contracts\CommentManagementInterface;
-use VendorName\SocialConnect\Contracts\MessagingInterface;
-use VendorName\SocialConnect\Contracts\MetricsInterface;
-use VendorName\SocialConnect\Contracts\PublishableInterface;
-use VendorName\SocialConnect\Contracts\SocialPlatformInterface;
-use VendorName\SocialConnect\Models\SocialAccount;
+use VendorName\SocialConnect\Services\Facebook\FacebookService;
+use VendorName\SocialConnect\Services\Facebook\FacebookPublishingService;
+use VendorName\SocialConnect\Services\Facebook\FacebookMetricsService;
+use VendorName\SocialConnect\Services\Facebook\FacebookMessagingService;
+use VendorName\SocialConnect\Services\Facebook\FacebookCommentService;
+use VendorName\SocialConnect\Services\Instagram\InstagramService;
+use VendorName\SocialConnect\Services\Instagram\InstagramPublishingService;
+use VendorName\SocialConnect\Services\Instagram\InstagramMetricsService;
+use VendorName\SocialConnect\Services\Instagram\InstagramMessagingService;
+use VendorName\SocialConnect\Services\Instagram\InstagramCommentService;
+use VendorName\SocialConnect\Services\Twitter\TwitterService;
+use VendorName\SocialConnect\Services\Twitter\TwitterPublishingService;
+use VendorName\SocialConnect\Services\Twitter\TwitterMetricsService;
+use VendorName\SocialConnect\Services\Twitter\TwitterMessagingService;
+use VendorName\SocialConnect\Services\Twitter\TwitterCommentService;
+use VendorName\SocialConnect\Services\LinkedIn\LinkedInService;
+use VendorName\SocialConnect\Services\LinkedIn\LinkedInPublishingService;
+use VendorName\SocialConnect\Services\LinkedIn\LinkedInMetricsService;
+use VendorName\SocialConnect\Services\LinkedIn\LinkedInMessagingService;
+use VendorName\SocialConnect\Services\LinkedIn\LinkedInCommentService;
+use VendorName\SocialConnect\Services\YouTube\YouTubeService;
+use VendorName\SocialConnect\Services\YouTube\YouTubePublishingService;
+use VendorName\SocialConnect\Services\YouTube\YouTubeMetricsService;
+use VendorName\SocialConnect\Services\YouTube\YouTubeMessagingService;
+use VendorName\SocialConnect\Services\YouTube\YouTubeCommentService;
 
 class SocialConnectServiceProvider extends ServiceProvider
 {
     /**
-     * Bootstrap the application services.
-     *
-     * @return void
-     */
-    public function boot()
-    {
-        // Publish configuration
-        $this->publishes([
-            __DIR__ . '/../config/social-connect.php' => config_path('social-connect.php'),
-        ], 'config');
-
-        // Publish migrations
-        $this->publishes([
-            __DIR__ . '/../database/migrations/' => database_path('migrations'),
-        ], 'migrations');
-
-        // Load routes
-        $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
-
-        // Load views
-        $this->loadViewsFrom(__DIR__ . '/../resources/views', 'social-connect');
-        
-        // Publish views
-        $this->publishes([
-            __DIR__ . '/../resources/views' => resource_path('views/vendor/social-connect'),
-        ], 'views');
-    }
-
-    /**
-     * Register the application services.
+     * Register services.
      *
      * @return void
      */
     public function register()
     {
-        // Merge configuration
         $this->mergeConfigFrom(
-            __DIR__ . '/../config/social-connect.php', 'social-connect'
+            __DIR__."/../config/social-connect.php", "social-connect"
         );
 
-        // Register the main service
-        $this->app->singleton('social-connect', function ($app) {
+        // Register the main SocialConnectManager
+        $this->app->singleton(SocialConnectManager::class, function ($app) {
             return new SocialConnectManager($app);
         });
 
-        // Register platform services
-        $this->app->bind(SocialPlatformInterface::class, function ($app, $parameters) {
-            $account = $parameters['account'] ?? null;
-            
-            if (!$account instanceof SocialAccount) {
-                throw new \InvalidArgumentException('A valid social account must be provided.');
-            }
-            
-            switch ($account->platform) {
-                case 'facebook':
-                    return new Services\Facebook\FacebookService($account);
-                case 'instagram':
-                    return new Services\Instagram\InstagramService($account);
-                case 'twitter':
-                    return new Services\Twitter\TwitterService($account);
-                case 'linkedin':
-                    return new Services\LinkedIn\LinkedInService($account);
-                case 'youtube':
-                    return new Services\YouTube\YouTubeService($account);
-                default:
-                    throw new \InvalidArgumentException("Unsupported platform: {$account->platform}");
-            }
-        });
+        // Bind individual stateless service implementations
+        // These can be resolved directly or via the manager
+        $this->registerPlatformServices();
+    }
 
-        // Register publishing services
-        $this->app->bind(PublishableInterface::class, function ($app, $parameters) {
-            $account = $parameters['account'] ?? null;
-            
-            if (!$account instanceof SocialAccount) {
-                throw new \InvalidArgumentException('A valid social account must be provided.');
-            }
-            
-            switch ($account->platform) {
-                case 'facebook':
-                    return new Services\Facebook\FacebookPublishingService($account);
-                case 'instagram':
-                    return new Services\Instagram\InstagramPublishingService($account);
-                case 'twitter':
-                    return new Services\Twitter\TwitterPublishingService($account);
-                case 'linkedin':
-                    return new Services\LinkedIn\LinkedInPublishingService($account);
-                case 'youtube':
-                    return new Services\YouTube\YouTubePublishingService($account);
-                default:
-                    throw new \InvalidArgumentException("Unsupported platform: {$account->platform}");
-            }
-        });
+    /**
+     * Bootstrap services.
+     *
+     * @return void
+     */
+    public function boot()
+    {
+        if ($this->app->runningInConsole()) {
+            $this->publishes([
+                __DIR__."/../config/social-connect.php" => config_path("social-connect.php"),
+            ], "config");
 
-        // Register metrics services
-        $this->app->bind(MetricsInterface::class, function ($app, $parameters) {
-            $account = $parameters['account'] ?? null;
-            
-            if (!$account instanceof SocialAccount) {
-                throw new \InvalidArgumentException('A valid social account must be provided.');
-            }
-            
-            switch ($account->platform) {
-                case 'facebook':
-                    return new Services\Facebook\FacebookMetricsService($account);
-                case 'instagram':
-                    return new Services\Instagram\InstagramMetricsService($account);
-                case 'twitter':
-                    return new Services\Twitter\TwitterMetricsService($account);
-                case 'linkedin':
-                    return new Services\LinkedIn\LinkedInMetricsService($account);
-                case 'youtube':
-                    return new Services\YouTube\YouTubeMetricsService($account);
-                default:
-                    throw new \InvalidArgumentException("Unsupported platform: {$account->platform}");
-            }
-        });
+            // No migrations to publish anymore
+            // $this->publishes([
+            //     __DIR__."/../database/migrations/" => database_path("migrations"),
+            // ], "migrations");
+        }
 
-        // Register messaging services
-        $this->app->bind(MessagingInterface::class, function ($app, $parameters) {
-            $account = $parameters['account'] ?? null;
-            
-            if (!$account instanceof SocialAccount) {
-                throw new \InvalidArgumentException('A valid social account must be provided.');
-            }
-            
-            switch ($account->platform) {
-                case 'facebook':
-                    return new Services\Facebook\FacebookMessagingService($account);
-                case 'instagram':
-                    return new Services\Instagram\InstagramMessagingService($account);
-                case 'twitter':
-                    return new Services\Twitter\TwitterMessagingService($account);
-                case 'linkedin':
-                    return new Services\LinkedIn\LinkedInMessagingService($account);
-                case 'youtube':
-                    return new Services\YouTube\YouTubeMessagingService($account);
-                default:
-                    throw new \InvalidArgumentException("Unsupported platform: {$account->platform}");
-            }
-        });
+        // No routes or views defined in this stateless version
+    }
 
-        // Register comment management services
-        $this->app->bind(CommentManagementInterface::class, function ($app, $parameters) {
-            $account = $parameters['account'] ?? null;
-            
-            if (!$account instanceof SocialAccount) {
-                throw new \InvalidArgumentException('A valid social account must be provided.');
-            }
-            
-            switch ($account->platform) {
-                case 'facebook':
-                    return new Services\Facebook\FacebookCommentService($account);
-                case 'instagram':
-                    return new Services\Instagram\InstagramCommentService($account);
-                case 'twitter':
-                    return new Services\Twitter\TwitterCommentService($account);
-                case 'linkedin':
-                    return new Services\LinkedIn\LinkedInCommentService($account);
-                case 'youtube':
-                    return new Services\YouTube\YouTubeCommentService($account);
-                default:
-                    throw new \InvalidArgumentException("Unsupported platform: {$account->platform}");
-            }
-        });
+    /**
+     * Register the individual platform service bindings.
+     */
+    protected function registerPlatformServices()
+    {
+        // Facebook
+        $this->app->singleton(FacebookService::class);
+        $this->app->singleton(FacebookPublishingService::class);
+        $this->app->singleton(FacebookMetricsService::class);
+        $this->app->singleton(FacebookMessagingService::class);
+        $this->app->singleton(FacebookCommentService::class);
+
+        // Instagram
+        $this->app->singleton(InstagramService::class);
+        $this->app->singleton(InstagramPublishingService::class);
+        $this->app->singleton(InstagramMetricsService::class);
+        $this->app->singleton(InstagramMessagingService::class);
+        $this->app->singleton(InstagramCommentService::class);
+
+        // Twitter
+        $this->app->singleton(TwitterService::class);
+        $this->app->singleton(TwitterPublishingService::class);
+        $this->app->singleton(TwitterMetricsService::class);
+        $this->app->singleton(TwitterMessagingService::class);
+        $this->app->singleton(TwitterCommentService::class);
+
+        // LinkedIn
+        $this->app->singleton(LinkedInService::class);
+        $this->app->singleton(LinkedInPublishingService::class);
+        $this->app->singleton(LinkedInMetricsService::class);
+        $this->app->singleton(LinkedInMessagingService::class);
+        $this->app->singleton(LinkedInCommentService::class);
+
+        // YouTube
+        $this->app->singleton(YouTubeService::class);
+        $this->app->singleton(YouTubePublishingService::class);
+        $this->app->singleton(YouTubeMetricsService::class);
+        $this->app->singleton(YouTubeMessagingService::class);
+        $this->app->singleton(YouTubeCommentService::class);
     }
 }

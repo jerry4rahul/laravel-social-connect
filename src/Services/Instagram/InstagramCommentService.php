@@ -3,627 +3,384 @@
 namespace VendorName\SocialConnect\Services\Instagram;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
 use VendorName\SocialConnect\Contracts\CommentManagementInterface;
 use VendorName\SocialConnect\Exceptions\CommentException;
-use VendorName\SocialConnect\Models\SocialAccount;
-use VendorName\SocialConnect\Models\SocialComment;
-use VendorName\SocialConnect\Models\SocialPost;
 
 class InstagramCommentService implements CommentManagementInterface
 {
     /**
-     * The HTTP client instance.
+     * The HTTP client instance for Instagram Graph API.
      *
      * @var \GuzzleHttp\Client
      */
-    protected $client;
+    protected $graphClient;
 
     /**
-     * The social account instance.
+     * Facebook Graph API version (used for Instagram Graph API).
      *
-     * @var \VendorName\SocialConnect\Models\SocialAccount
+     * @var string
      */
-    protected $account;
+    protected $graphVersion;
 
     /**
      * Create a new InstagramCommentService instance.
-     *
-     * @param \VendorName\SocialConnect\Models\SocialAccount $account
      */
-    public function __construct(SocialAccount $account)
+    public function __construct()
     {
-        $this->account = $account;
-        $this->client = new Client([
-            'base_uri' => 'https://graph.facebook.com/v18.0/',
-            'timeout' => 30,
+        // Comments use the Instagram Graph API (via Facebook Graph API endpoint)
+        $config = Config::get("social-connect.platforms.facebook"); // Use Facebook config for Graph API version
+        $this->graphVersion = $config["graph_version"] ?? "v18.0";
+
+        $this->graphClient = new Client([
+            "base_uri" => "https://graph.facebook.com/{$this->graphVersion}/",
+            "timeout" => 30,
         ]);
     }
 
     /**
-     * Get comments for a specific post.
+     * Get comments for a specific Instagram media post.
      *
-     * @param string $postId
-     * @param int $limit
-     * @param string|null $cursor
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $postId The ID of the Instagram Media Object.
+     * @param int $limit Maximum number of comments to return.
+     * @param string|null $cursor Pagination cursor.
+     * @param string $order Order (not typically supported by IG comments endpoint).
+     * @return array Returns array containing comments and next cursor.
+     * @throws CommentException
      */
-    public function getComments(string $postId, int $limit = 20, ?string $cursor = null): array
+    public function getComments(string $accessToken, string $postId, int $limit = 25, ?string $cursor = null, string $order = "chronological"): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            
             $params = [
-                'fields' => 'id,text,username,timestamp,like_count,replies{id,text,username,timestamp,like_count}',
-                'limit' => $limit,
+                "fields" => "id,text,timestamp,username,from{id,username},like_count,replies{id,text,timestamp,username,like_count}", // Request replies inline if needed
+                "access_token" => $accessToken,
+                "limit" => $limit,
             ];
-            
+
             if ($cursor) {
-                $params['after'] = $cursor;
+                $params["after"] = $cursor;
             }
-            
-            $response = $this->client->get("{$postId}/comments", [
-                'query' => array_merge($params, ['access_token' => $accessToken]),
+
+            $response = $this->graphClient->get("{$postId}/comments", [
+                "query" => $params,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['data'])) {
-                throw new CommentException('Failed to retrieve comments from Instagram.');
+
+            if (!isset($data["data"])) {
+                throw new CommentException("Failed to retrieve comments from Instagram.");
             }
-            
-            // Get the post from database
-            $socialPost = SocialPost::where('platform_post_id', $postId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            $comments = [];
-            $nextCursor = $data['paging']['cursors']['after'] ?? null;
-            
-            foreach ($data['data'] as $comment) {
-                $commenterId = $comment['username'] ?? null;
-                $commenterName = $comment['username'] ?? null;
-                
-                // Store in database
-                $socialComment = SocialComment::updateOrCreate(
-                    [
-                        'social_account_id' => $this->account->id,
-                        'platform_comment_id' => $comment['id'],
-                    ],
-                    [
-                        'user_id' => $this->account->user_id,
-                        'social_post_id' => $socialPost ? $socialPost->id : null,
-                        'platform' => 'instagram',
-                        'platform_post_id' => $postId,
-                        'comment' => $comment['text'] ?? '',
-                        'commenter_id' => $commenterId,
-                        'commenter_name' => $commenterName,
-                        'is_reply' => false,
-                        'like_count' => $comment['like_count'] ?? 0,
-                        'reply_count' => isset($comment['replies']) ? count($comment['replies']['data'] ?? []) : 0,
-                        'metadata' => [
-                            'created_time' => $comment['timestamp'] ?? null,
-                        ],
-                    ]
-                );
-                
-                // Process replies if available
-                $replies = [];
-                
-                if (isset($comment['replies']['data']) && !empty($comment['replies']['data'])) {
-                    foreach ($comment['replies']['data'] as $reply) {
-                        $replyCommenterId = $reply['username'] ?? null;
-                        $replyCommenterName = $reply['username'] ?? null;
-                        
-                        // Store reply in database
-                        $socialReply = SocialComment::updateOrCreate(
-                            [
-                                'social_account_id' => $this->account->id,
-                                'platform_comment_id' => $reply['id'],
-                            ],
-                            [
-                                'user_id' => $this->account->user_id,
-                                'social_post_id' => $socialPost ? $socialPost->id : null,
-                                'platform' => 'instagram',
-                                'platform_post_id' => $postId,
-                                'comment' => $reply['text'] ?? '',
-                                'commenter_id' => $replyCommenterId,
-                                'commenter_name' => $replyCommenterName,
-                                'parent_id' => $socialComment->id,
-                                'is_reply' => true,
-                                'like_count' => $reply['like_count'] ?? 0,
-                                'metadata' => [
-                                    'created_time' => $reply['timestamp'] ?? null,
-                                ],
-                            ]
-                        );
-                        
-                        $replies[] = [
-                            'id' => $socialReply->id,
-                            'platform_comment_id' => $reply['id'],
-                            'comment' => $reply['text'] ?? '',
-                            'commenter_id' => $replyCommenterId,
-                            'commenter_name' => $replyCommenterName,
-                            'created_at' => $reply['timestamp'] ?? null,
-                            'like_count' => $reply['like_count'] ?? 0,
-                        ];
-                    }
-                }
-                
-                $comments[] = [
-                    'id' => $socialComment->id,
-                    'platform_comment_id' => $comment['id'],
-                    'comment' => $comment['text'] ?? '',
-                    'commenter_id' => $commenterId,
-                    'commenter_name' => $commenterName,
-                    'created_at' => $comment['timestamp'] ?? null,
-                    'like_count' => $comment['like_count'] ?? 0,
-                    'reply_count' => isset($comment['replies']) ? count($comment['replies']['data'] ?? []) : 0,
-                    'replies' => $replies,
-                ];
-            }
-            
+
+            $comments = $data["data"];
+            $nextCursor = $data["paging"]["cursors"]["after"] ?? null;
+
+            // Format the output
+            $formattedComments = array_map(function ($comment) {
+                return $this->formatCommentData($comment);
+            }, $comments);
+
             return [
-                'post_id' => $socialPost ? $socialPost->id : null,
-                'platform_post_id' => $postId,
-                'comments' => $comments,
-                'next_cursor' => $nextCursor,
+                "platform" => "instagram",
+                "post_id" => $postId,
+                "comments" => $formattedComments,
+                "next_cursor" => $nextCursor,
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to get comments from Instagram: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to get Instagram comments: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Get replies to a specific comment.
      *
-     * @param string $commentId
-     * @param int $limit
-     * @param string|null $cursor
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $commentId The ID of the parent comment.
+     * @param int $limit Maximum number of replies to return.
+     * @param string|null $cursor Pagination cursor.
+     * @return array Returns array containing replies and next cursor.
+     * @throws CommentException
      */
-    public function getCommentReplies(string $commentId, int $limit = 20, ?string $cursor = null): array
+    public function getCommentReplies(string $accessToken, string $commentId, int $limit = 25, ?string $cursor = null): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            
             $params = [
-                'fields' => 'id,text,username,timestamp,like_count',
-                'limit' => $limit,
+                "fields" => "id,text,timestamp,username,like_count",
+                "access_token" => $accessToken,
+                "limit" => $limit,
             ];
-            
+
             if ($cursor) {
-                $params['after'] = $cursor;
+                $params["after"] = $cursor;
             }
-            
-            $response = $this->client->get("{$commentId}/replies", [
-                'query' => array_merge($params, ['access_token' => $accessToken]),
+
+            $response = $this->graphClient->get("{$commentId}/replies", [
+                "query" => $params,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['data'])) {
-                throw new CommentException('Failed to retrieve comment replies from Instagram.');
+
+            if (!isset($data["data"])) {
+                throw new CommentException("Failed to retrieve comment replies from Instagram.");
             }
-            
-            // Get the parent comment from database
-            $parentComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            $replies = [];
-            $nextCursor = $data['paging']['cursors']['after'] ?? null;
-            
-            foreach ($data['data'] as $reply) {
-                $commenterId = $reply['username'] ?? null;
-                $commenterName = $reply['username'] ?? null;
-                
-                // Store in database
-                $socialComment = SocialComment::updateOrCreate(
-                    [
-                        'social_account_id' => $this->account->id,
-                        'platform_comment_id' => $reply['id'],
+
+            $replies = $data["data"];
+            $nextCursor = $data["paging"]["cursors"]["after"] ?? null;
+
+            // Format the output (similar to comments, but simpler structure for replies)
+            $formattedReplies = array_map(function ($reply) {
+                 return [
+                    "platform_comment_id" => $reply["id"],
+                    "message" => $reply["text"] ?? null,
+                    "from" => [
+                        "id" => null, // API doesn't provide 'from' for replies directly
+                        "name" => $reply["username"] ?? null,
+                        "avatar" => null,
                     ],
-                    [
-                        'user_id' => $this->account->user_id,
-                        'social_post_id' => $parentComment ? $parentComment->social_post_id : null,
-                        'platform' => 'instagram',
-                        'platform_post_id' => $parentComment ? $parentComment->platform_post_id : null,
-                        'comment' => $reply['text'] ?? '',
-                        'commenter_id' => $commenterId,
-                        'commenter_name' => $commenterName,
-                        'parent_id' => $parentComment ? $parentComment->id : null,
-                        'is_reply' => true,
-                        'like_count' => $reply['like_count'] ?? 0,
-                        'metadata' => [
-                            'created_time' => $reply['timestamp'] ?? null,
-                        ],
-                    ]
-                );
-                
-                $replies[] = [
-                    'id' => $socialComment->id,
-                    'platform_comment_id' => $reply['id'],
-                    'comment' => $reply['text'] ?? '',
-                    'commenter_id' => $commenterId,
-                    'commenter_name' => $commenterName,
-                    'created_at' => $reply['timestamp'] ?? null,
-                    'like_count' => $reply['like_count'] ?? 0,
+                    "created_time" => $reply["timestamp"] ?? null,
+                    "like_count" => $reply["like_count"] ?? 0,
+                    "parent_id" => $commentId,
+                    // Other fields like can_comment, can_like etc. are not available for replies endpoint
                 ];
-            }
-            
+            }, $replies);
+
             return [
-                'parent_comment_id' => $parentComment ? $parentComment->id : null,
-                'platform_comment_id' => $commentId,
-                'replies' => $replies,
-                'next_cursor' => $nextCursor,
+                "platform" => "instagram",
+                "parent_comment_id" => $commentId,
+                "comments" => $formattedReplies, // Using 'comments' key for consistency
+                "next_cursor" => $nextCursor,
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to get comment replies from Instagram: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to get Instagram comment replies: " . $e->getMessage());
         }
     }
-    
+
     /**
-     * Post a new comment on a post.
+     * Post a new comment on an Instagram media post.
      *
-     * @param string $postId
-     * @param string $comment
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $targetId The ID of the Instagram Media Object.
+     * @param string $comment The text content of the comment.
+     * @param array $options Additional options (ignored).
+     * @return array Returns array with platform_comment_id.
+     * @throws CommentException
      */
-    public function postComment(string $postId, string $comment, array $options = []): array
+    public function postComment(string $accessToken, string $targetId, string $comment, array $options = []): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $params = [
-                'message' => $comment,
-                'access_token' => $accessToken,
+            $payload = [
+                "message" => $comment,
+                "access_token" => $accessToken,
             ];
-            
-            $response = $this->client->post("{$postId}/comments", [
-                'form_params' => $params,
+
+            $response = $this->graphClient->post("{$targetId}/comments", [
+                "form_params" => $payload,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new CommentException('Failed to post comment to Instagram.');
+
+            if (!isset($data["id"])) {
+                throw new CommentException("Failed to post comment to Instagram. No comment ID returned.");
             }
-            
-            // Get the post from database
-            $socialPost = SocialPost::where('platform_post_id', $postId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            // Get Instagram account details
-            $igAccountId = $this->getInstagramAccountId();
-            
-            // Store in database
-            $socialComment = SocialComment::create([
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'social_post_id' => $socialPost ? $socialPost->id : null,
-                'platform' => 'instagram',
-                'platform_comment_id' => $data['id'],
-                'platform_post_id' => $postId,
-                'comment' => $comment,
-                'commenter_id' => $igAccountId,
-                'commenter_name' => $this->account->name,
-                'is_reply' => false,
-                'metadata' => [
-                    'created_time' => now()->toIso8601String(),
-                ],
-            ]);
-            
+
             return [
-                'success' => true,
-                'comment_id' => $socialComment->id,
-                'platform_comment_id' => $data['id'],
-                'post_id' => $socialPost ? $socialPost->id : null,
-                'platform_post_id' => $postId,
+                "platform" => "instagram",
+                "platform_comment_id" => $data["id"],
+                "target_id" => $targetId,
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to post comment to Instagram: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to post Instagram comment: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Reply to an existing comment.
      *
-     * @param string $commentId
-     * @param string $reply
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $commentId The ID of the comment to reply to.
+     * @param string $reply The text content of the reply.
+     * @param array $options Additional options (ignored).
+     * @return array Returns array with platform_comment_id.
+     * @throws CommentException
      */
-    public function replyToComment(string $commentId, string $reply, array $options = []): array
+    public function replyToComment(string $accessToken, string $commentId, string $reply, array $options = []): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $params = [
-                'message' => $reply,
-                'access_token' => $accessToken,
+            $payload = [
+                "message" => $reply,
+                "access_token" => $accessToken,
             ];
-            
-            $response = $this->client->post("{$commentId}/replies", [
-                'form_params' => $params,
+
+            $response = $this->graphClient->post("{$commentId}/replies", [
+                "form_params" => $payload,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new CommentException('Failed to reply to comment on Instagram.');
+
+            if (!isset($data["id"])) {
+                throw new CommentException("Failed to reply to Instagram comment. No reply ID returned.");
             }
-            
-            // Get the parent comment from database
-            $parentComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            // Get Instagram account details
-            $igAccountId = $this->getInstagramAccountId();
-            
-            // Store in database
-            $socialComment = SocialComment::create([
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'social_post_id' => $parentComment ? $parentComment->social_post_id : null,
-                'platform' => 'instagram',
-                'platform_comment_id' => $data['id'],
-                'platform_post_id' => $parentComment ? $parentComment->platform_post_id : null,
-                'comment' => $reply,
-                'commenter_id' => $igAccountId,
-                'commenter_name' => $this->account->name,
-                'parent_id' => $parentComment ? $parentComment->id : null,
-                'is_reply' => true,
-                'metadata' => [
-                    'created_time' => now()->toIso8601String(),
+
+            return [
+                "platform" => "instagram",
+                "platform_comment_id" => $data["id"], // This is the ID of the reply
+                "parent_comment_id" => $commentId,
+                "raw_response" => $data,
+            ];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to reply to Instagram comment: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Like or react to a comment (Not supported by Instagram API).
+     *
+     * @param string $accessToken
+     * @param string $commentId
+     * @param string $reactionType
+     * @return bool
+     * @throws CommentException
+     */
+    public function reactToComment(string $accessToken, string $commentId, string $reactionType = "LIKE"): bool
+    {
+        throw new CommentException("Reacting to comments is not supported by the Instagram Graph API.");
+    }
+
+    /**
+     * Remove a reaction from a comment (Not supported by Instagram API).
+     *
+     * @param string $accessToken
+     * @param string $commentId
+     * @param string $reactionType
+     * @return bool
+     * @throws CommentException
+     */
+    public function removeCommentReaction(string $accessToken, string $commentId, string $reactionType = "LIKE"): bool
+    {
+        throw new CommentException("Removing reactions from comments is not supported by the Instagram Graph API.");
+    }
+
+    /**
+     * Delete a comment or reply.
+     *
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $commentId The ID of the comment or reply to delete.
+     * @return bool Returns true on success.
+     * @throws CommentException
+     */
+    public function deleteComment(string $accessToken, string $commentId): bool
+    {
+        try {
+            $response = $this->graphClient->delete($commentId, [
+                "query" => [
+                    "access_token" => $accessToken,
                 ],
             ]);
-            
-            // Update parent comment reply count
-            if ($parentComment) {
-                $parentComment->increment('reply_count');
-            }
-            
-            return [
-                'success' => true,
-                'comment_id' => $socialComment->id,
-                'platform_comment_id' => $data['id'],
-                'parent_comment_id' => $parentComment ? $parentComment->id : null,
-                'parent_platform_comment_id' => $commentId,
-            ];
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to reply to comment on Instagram: ' . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Like or react to a comment.
-     *
-     * @param string $commentId
-     * @param string $reactionType
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
-     */
-    public function reactToComment(string $commentId, string $reactionType = 'like'): bool
-    {
-        try {
-            // Instagram only supports liking comments, not other reaction types
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->post("{$commentId}/likes", [
-                'query' => ['access_token' => $accessToken],
-            ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to like comment on Instagram.');
-            }
-            
-            // Update in database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment) {
-                $socialComment->increment('like_count');
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to like comment on Instagram: ' . $e->getMessage());
+
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to delete Instagram comment: " . $e->getMessage());
         }
     }
-    
-    /**
-     * Remove a reaction from a comment.
-     *
-     * @param string $commentId
-     * @param string $reactionType
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
-     */
-    public function removeCommentReaction(string $commentId, string $reactionType = 'like'): bool
-    {
-        try {
-            // Instagram only supports unliking comments, not other reaction types
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->delete("{$commentId}/likes", [
-                'query' => ['access_token' => $accessToken],
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to unlike comment on Instagram.');
-            }
-            
-            // Update in database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment && $socialComment->like_count > 0) {
-                $socialComment->decrement('like_count');
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to unlike comment on Instagram: ' . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Delete a comment.
-     *
-     * @param string $commentId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
-     */
-    public function deleteComment(string $commentId): bool
-    {
-        try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->delete($commentId, [
-                'query' => ['access_token' => $accessToken],
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to delete comment on Instagram.');
-            }
-            
-            // Delete from database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment) {
-                // If this is a reply, decrement parent's reply count
-                if ($socialComment->is_reply && $socialComment->parent_id) {
-                    $parentComment = SocialComment::find($socialComment->parent_id);
-                    
-                    if ($parentComment && $parentComment->reply_count > 0) {
-                        $parentComment->decrement('reply_count');
-                    }
-                }
-                
-                $socialComment->delete();
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to delete comment on Instagram: ' . $e->getMessage());
-        }
-    }
-    
+
     /**
      * Hide a comment.
      *
-     * @param string $commentId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $commentId The ID of the comment to hide.
+     * @return bool Returns true on success.
+     * @throws CommentException
      */
-    public function hideComment(string $commentId): bool
+    public function hideComment(string $accessToken, string $commentId): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->post("{$commentId}/hide", [
-                'query' => [
-                    'access_token' => $accessToken,
-                    'hide' => true,
+            $response = $this->graphClient->post($commentId, [
+                "form_params" => [
+                    "hide" => "true",
+                    "access_token" => $accessToken,
                 ],
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to hide comment on Instagram.');
-            }
-            
-            // Update in database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment) {
-                $socialComment->update([
-                    'is_hidden' => true,
-                ]);
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to hide comment on Instagram: ' . $e->getMessage());
+
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to hide Instagram comment: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Unhide a comment.
      *
-     * @param string $commentId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $commentId The ID of the comment to unhide.
+     * @return bool Returns true on success.
+     * @throws CommentException
      */
-    public function unhideComment(string $commentId): bool
+    public function unhideComment(string $accessToken, string $commentId): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->post("{$commentId}/hide", [
-                'query' => [
-                    'access_token' => $accessToken,
-                    'hide' => false,
+            $response = $this->graphClient->post($commentId, [
+                "form_params" => [
+                    "hide" => "false",
+                    "access_token" => $accessToken,
                 ],
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to unhide comment on Instagram.');
-            }
-            
-            // Update in database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment) {
-                $socialComment->update([
-                    'is_hidden' => false,
-                ]);
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to unhide comment on Instagram: ' . $e->getMessage());
+
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to unhide Instagram comment: " . $e->getMessage());
         }
     }
-    
+
     /**
-     * Get the Instagram account ID from the account metadata.
+     * Helper function to format comment data consistently.
      *
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param array $comment Raw comment data from API.
+     * @return array Formatted comment data.
      */
-    protected function getInstagramAccountId(): string
+    protected function formatCommentData(array $comment): array
     {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['instagram_business_account_id'])) {
-            return $metadata['instagram_business_account_id'];
+        $formattedReplies = [];
+        if (isset($comment["replies"]["data"])) {
+            $formattedReplies = array_map(function ($reply) use ($comment) {
+                 return [
+                    "platform_comment_id" => $reply["id"],
+                    "message" => $reply["text"] ?? null,
+                    "from" => [
+                        "id" => null,
+                        "name" => $reply["username"] ?? null,
+                        "avatar" => null,
+                    ],
+                    "created_time" => $reply["timestamp"] ?? null,
+                    "like_count" => $reply["like_count"] ?? 0,
+                    "parent_id" => $comment["id"],
+                ];
+            }, $comment["replies"]["data"]);
         }
-        
-        throw new CommentException('Instagram account ID not found in account metadata.');
+
+        return [
+            "platform_comment_id" => $comment["id"],
+            "message" => $comment["text"] ?? null,
+            "from" => [
+                "id" => $comment["from"]["id"] ?? null,
+                "name" => $comment["from"]["username"] ?? ($comment["username"] ?? null),
+                "avatar" => null, // Not provided by API
+            ],
+            "created_time" => $comment["timestamp"] ?? null,
+            "like_count" => $comment["like_count"] ?? 0,
+            "replies" => $formattedReplies,
+            "reply_count" => count($formattedReplies), // Calculate based on fetched replies
+            "parent_id" => null, // Top-level comments have null parent
+            // Fields like can_comment, can_like, can_hide, is_hidden are not standard in IG comment object
+        ];
     }
 }

@@ -3,6 +3,9 @@
 namespace VendorName\SocialConnect\Services\LinkedIn;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\URL;
 use VendorName\SocialConnect\Contracts\SocialPlatformInterface;
 use VendorName\SocialConnect\Exceptions\AuthenticationException;
 
@@ -16,336 +19,248 @@ class LinkedInService implements SocialPlatformInterface
     protected $client;
 
     /**
-     * The client ID.
+     * LinkedIn Client ID.
      *
      * @var string
      */
     protected $clientId;
 
     /**
-     * The client secret.
+     * LinkedIn Client Secret.
      *
      * @var string
      */
     protected $clientSecret;
 
     /**
-     * The redirect URL.
+     * LinkedIn Redirect URI.
      *
      * @var string
      */
-    protected $redirectUrl;
+    protected $redirectUri;
 
     /**
      * Create a new LinkedInService instance.
-     *
-     * @param string $clientId
-     * @param string $clientSecret
-     * @param string|null $redirectUrl
      */
-    public function __construct(string $clientId, string $clientSecret, string $redirectUrl = null)
+    public function __construct()
     {
-        $this->clientId = $clientId;
-        $this->clientSecret = $clientSecret;
-        $this->redirectUrl = $redirectUrl;
+        $config = Config::get("social-connect.platforms.linkedin");
+
+        if (!isset($config["client_id"], $config["client_secret"], $config["redirect_uri"])) {
+            throw new AuthenticationException("LinkedIn client ID, client secret, or redirect URI is not configured.");
+        }
+
+        $this->clientId = $config["client_id"];
+        $this->clientSecret = $config["client_secret"];
+        $this->redirectUri = $config["redirect_uri"];
+
         $this->client = new Client([
-            'base_uri' => 'https://api.linkedin.com/',
-            'timeout' => 30,
+            "base_uri" => "https://www.linkedin.com/",
+            "timeout" => 30,
         ]);
     }
 
     /**
-     * Get the authorization URL for LinkedIn.
+     * Get the authentication redirect URL.
      *
-     * @param array $scopes
-     * @param string $redirectUrl
+     * @param array $params Optional parameters (e.g., state, scope).
      * @return string
      */
-    public function getAuthorizationUrl(array $scopes = [], string $redirectUrl = null): string
+    public function getRedirectUrl(array $params = []): string
     {
-        $scopes = count($scopes) > 0 ? $scopes : $this->getDefaultScopes();
-        $redirectUrl = $redirectUrl ?: $this->redirectUrl;
-        $state = $this->generateState();
-        
-        // Store state in session for verification
-        session(['linkedin_oauth_state' => $state]);
-
-        $params = [
-            'response_type' => 'code',
-            'client_id' => $this->clientId,
-            'redirect_uri' => $redirectUrl,
-            'scope' => implode(' ', $scopes),
-            'state' => $state,
+        $defaultScopes = [
+            "profile", "email", "openid", // Basic profile
+            "w_member_social", // Post updates, make comments, like posts
+            "r_liteprofile", "r_emailaddress", // Basic profile read
+            "r_organization_social", "w_organization_social", // Company page posts/comments
+            "rw_organization_admin", // Manage company pages & retrieve reporting data
+            "r_ads", "rw_ads", // Ads related permissions (if needed)
+            "r_basicprofile", // Deprecated but sometimes needed
+            "r_1st_connections_size", // Get number of connections
+            "r_compliance", "w_compliance", // Compliance endpoints (if needed)
+            "r_marketing_partner_leads", "rw_marketing_partner_leads" // Lead Gen Forms (if needed)
         ];
 
-        return 'https://www.linkedin.com/oauth/v2/authorization?' . http_build_query($params);
+        $scopes = $params["scope"] ?? Config::get("social-connect.platforms.linkedin.scopes", $defaultScopes);
+        $state = $params["state"] ?? bin2hex(random_bytes(16));
+
+        $query = http_build_query([
+            "response_type" => "code",
+            "client_id" => $this->clientId,
+            "redirect_uri" => $this->redirectUri,
+            "state" => $state,
+            "scope" => implode(" ", $scopes),
+        ]);
+
+        return "https://www.linkedin.com/oauth/v2/authorization?" . $query;
     }
 
     /**
-     * Handle the callback from LinkedIn and retrieve the access token.
+     * Exchange authorization code for an access token.
      *
-     * @param string $code
-     * @param string $redirectUrl
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
+     * @param string $code Authorization code from callback.
+     * @param string|null $state State parameter (optional, for verification).
+     * @return array Returns an array containing token information and basic user profile.
+     * @throws AuthenticationException
      */
-    public function handleCallback(string $code, string $redirectUrl = null): array
+    public function exchangeCodeForToken(string $code, ?string $state = null): array
     {
-        $redirectUrl = $redirectUrl ?: $this->redirectUrl;
-
         try {
-            $response = $this->client->post('oauth/v2/accessToken', [
-                'headers' => [
-                    'Content-Type' => 'application/x-www-form-urlencoded',
-                ],
-                'form_params' => [
-                    'grant_type' => 'authorization_code',
-                    'code' => $code,
-                    'redirect_uri' => $redirectUrl,
-                    'client_id' => $this->clientId,
-                    'client_secret' => $this->clientSecret,
+            $response = $this->client->post("oauth/v2/accessToken", [
+                "form_params" => [
+                    "grant_type" => "authorization_code",
+                    "code" => $code,
+                    "redirect_uri" => $this->redirectUri,
+                    "client_id" => $this->clientId,
+                    "client_secret" => $this->clientSecret,
                 ],
             ]);
 
-            $data = json_decode($response->getBody()->getContents(), true);
+            $tokenData = json_decode($response->getBody()->getContents(), true);
 
-            if (!isset($data['access_token'])) {
-                throw new AuthenticationException('Failed to retrieve access token from LinkedIn.');
+            if (!isset($tokenData["access_token"])) {
+                throw new AuthenticationException("Failed to retrieve access token from LinkedIn.");
             }
 
-            // Get user profile
-            $profile = $this->getUserProfile($data['access_token']);
+            // Get user profile using the access token
+            $profileData = $this->getUserProfile($tokenData["access_token"]);
+            $emailData = $this->getUserEmail($tokenData["access_token"]);
 
             return [
-                'access_token' => $data['access_token'],
-                'refresh_token' => $data['refresh_token'] ?? null,
-                'expires_in' => $data['expires_in'] ?? 86400, // Default to 24 hours
-                'token_type' => $data['token_type'] ?? 'bearer',
-                'profile' => $profile,
+                "platform" => "linkedin",
+                "access_token" => $tokenData["access_token"],
+                "refresh_token" => $tokenData["refresh_token"] ?? null,
+                "token_secret" => null, // OAuth 2.0 doesn't use token secrets
+                "expires_in" => $tokenData["expires_in"] ?? null,
+                "platform_user_id" => $profileData["id"],
+                "name" => ($profileData["localizedFirstName"] ?? "") . " " . ($profileData["localizedLastName"] ?? ""),
+                "email" => $emailData["email"] ?? null,
+                "avatar" => $profileData["profilePicture"]["displayImage~"]["elements"][0]["identifiers"][0]["identifier"] ?? null,
+                "username" => null, // LinkedIn doesn't have a primary username like Twitter
+                "raw_token_data" => $tokenData,
+                "raw_profile_data" => $profileData,
+                "raw_email_data" => $emailData,
             ];
-        } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to authenticate with LinkedIn: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new AuthenticationException("LinkedIn token exchange failed: " . $e->getMessage());
         }
     }
 
     /**
-     * Refresh the access token using the refresh token.
-     *
-     * @param string $refreshToken
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
-     */
-    public function refreshAccessToken(string $refreshToken): array
-    {
-        try {
-            $response = $this->client->post('oauth/v2/accessToken', [
-                'headers' => [
-                    'Content-Type' => 'application/x-www-form-urlencoded',
-                ],
-                'form_params' => [
-                    'grant_type' => 'refresh_token',
-                    'refresh_token' => $refreshToken,
-                    'client_id' => $this->clientId,
-                    'client_secret' => $this->clientSecret,
-                ],
-            ]);
-
-            $data = json_decode($response->getBody()->getContents(), true);
-
-            if (!isset($data['access_token'])) {
-                throw new AuthenticationException('Failed to refresh access token from LinkedIn.');
-            }
-
-            return [
-                'access_token' => $data['access_token'],
-                'refresh_token' => $data['refresh_token'] ?? $refreshToken,
-                'expires_in' => $data['expires_in'] ?? 86400,
-                'token_type' => $data['token_type'] ?? 'bearer',
-            ];
-        } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to refresh token with LinkedIn: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Get the user profile from LinkedIn.
+     * Get user profile information using an access token.
      *
      * @param string $accessToken
      * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
+     * @throws AuthenticationException
      */
     public function getUserProfile(string $accessToken): array
     {
         try {
-            // Get basic profile
-            $response = $this->client->get('v2/me', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
+            $client = new Client(["base_uri" => "https://api.linkedin.com/v2/", "timeout" => 30]);
+            $response = $client->get("me", [
+                "headers" => [
+                    "Authorization" => "Bearer " . $accessToken,
+                    "Connection" => "Keep-Alive",
+                    "X-Restli-Protocol-Version" => "2.0.0", // Recommended header
                 ],
+                "query" => [
+                    // Request specific fields needed, including profile picture
+                    "projection" => "(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))"
+                ]
             ]);
 
-            $profile = json_decode($response->getBody()->getContents(), true);
+            $profileData = json_decode($response->getBody()->getContents(), true);
 
-            // Get email address
-            $emailResponse = $this->client->get('v2/emailAddress?q=members&projection=(elements*(handle~))', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-            ]);
-
-            $emailData = json_decode($emailResponse->getBody()->getContents(), true);
-            $email = $emailData['elements'][0]['handle~']['emailAddress'] ?? null;
-
-            // Get profile picture
-            $pictureResponse = $this->client->get('v2/me?projection=(profilePicture(displayImage~:playableStreams))', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-            ]);
-
-            $pictureData = json_decode($pictureResponse->getBody()->getContents(), true);
-            $picture = null;
-            
-            if (isset($pictureData['profilePicture']['displayImage~']['elements'])) {
-                foreach ($pictureData['profilePicture']['displayImage~']['elements'] as $element) {
-                    if (isset($element['identifiers'][0]['identifier'])) {
-                        $picture = $element['identifiers'][0]['identifier'];
-                        break;
-                    }
-                }
+            if (!isset($profileData["id"])) {
+                throw new AuthenticationException("Failed to retrieve user profile from LinkedIn.");
             }
 
-            // Get company pages if available
-            $companyPages = $this->getCompanyPages($accessToken);
+            return $profileData;
+        } catch (GuzzleException $e) {
+            throw new AuthenticationException("Failed to get LinkedIn user profile: " . $e->getMessage());
+        }
+    }
+
+     /**
+     * Get user email address using an access token.
+     *
+     * @param string $accessToken
+     * @return array
+     * @throws AuthenticationException
+     */
+    public function getUserEmail(string $accessToken): array
+    {
+        try {
+            $client = new Client(["base_uri" => "https://api.linkedin.com/v2/", "timeout" => 30]);
+            $response = $client->get("emailAddress", [
+                "headers" => [
+                    "Authorization" => "Bearer " . $accessToken,
+                    "Connection" => "Keep-Alive",
+                    "X-Restli-Protocol-Version" => "2.0.0",
+                ],
+                "query" => [
+                    "q" => "members",
+                    "projection" => "(elements*(handle~))"
+                ]
+            ]);
+
+            $emailData = json_decode($response->getBody()->getContents(), true);
+
+            // Extract the primary email
+            $primaryEmail = null;
+            if (isset($emailData["elements"][0]["handle~"]["emailAddress"])) {
+                $primaryEmail = $emailData["elements"][0]["handle~"]["emailAddress"];
+            }
+
+            if (!$primaryEmail) {
+                // Email might not be available or requires different scope/permissions
+                // Log::warning("Could not retrieve primary email from LinkedIn.", ["response" => $emailData]);
+                return ["email" => null, "raw_response" => $emailData];
+            }
+
+            return ["email" => $primaryEmail, "raw_response" => $emailData];
+        } catch (GuzzleException $e) {
+            // Don't fail the whole auth process if email fails, just return null
+            // Log::error("Failed to get LinkedIn user email: " . $e->getMessage());
+            return ["email" => null, "raw_response" => null];
+        }
+    }
+
+    /**
+     * Refresh an access token using a refresh token.
+     *
+     * @param string $refreshToken
+     * @return array Returns new token data.
+     * @throws AuthenticationException
+     */
+    public function refreshToken(string $refreshToken): array
+    {
+        try {
+            $response = $this->client->post("oauth/v2/accessToken", [
+                "form_params" => [
+                    "grant_type" => "refresh_token",
+                    "refresh_token" => $refreshToken,
+                    "client_id" => $this->clientId,
+                    "client_secret" => $this->clientSecret,
+                ],
+            ]);
+
+            $tokenData = json_decode($response->getBody()->getContents(), true);
+
+            if (!isset($tokenData["access_token"])) {
+                throw new AuthenticationException("Failed to refresh access token from LinkedIn.");
+            }
 
             return [
-                'id' => $profile['id'],
-                'firstName' => $profile['localizedFirstName'] ?? null,
-                'lastName' => $profile['localizedLastName'] ?? null,
-                'name' => ($profile['localizedFirstName'] ?? '') . ' ' . ($profile['localizedLastName'] ?? ''),
-                'email' => $email,
-                'avatar' => $picture,
-                'companyPages' => $companyPages,
+                "platform" => "linkedin",
+                "access_token" => $tokenData["access_token"],
+                "refresh_token" => $tokenData["refresh_token"] ?? $refreshToken, // Return new or old refresh token
+                "token_secret" => null,
+                "expires_in" => $tokenData["expires_in"] ?? null,
+                "raw_token_data" => $tokenData,
             ];
-        } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to get user profile from LinkedIn: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new AuthenticationException("LinkedIn token refresh failed: " . $e->getMessage());
         }
-    }
-
-    /**
-     * Get the user's company pages.
-     *
-     * @param string $accessToken
-     * @return array
-     */
-    public function getCompanyPages(string $accessToken): array
-    {
-        try {
-            $response = $this->client->get('v2/organizationalEntityAcls?q=roleAssignee', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-            ]);
-
-            $data = json_decode($response->getBody()->getContents(), true);
-            $pages = [];
-
-            if (isset($data['elements'])) {
-                foreach ($data['elements'] as $element) {
-                    if (isset($element['organizationalTarget'])) {
-                        $orgUrn = $element['organizationalTarget'];
-                        $orgId = str_replace('urn:li:organization:', '', $orgUrn);
-                        
-                        // Get organization details
-                        $orgResponse = $this->client->get("v2/organizations/{$orgId}", [
-                            'headers' => [
-                                'Authorization' => 'Bearer ' . $accessToken,
-                                'X-Restli-Protocol-Version' => '2.0.0',
-                            ],
-                        ]);
-                        
-                        $orgData = json_decode($orgResponse->getBody()->getContents(), true);
-                        
-                        $pages[] = [
-                            'id' => $orgId,
-                            'name' => $orgData['localizedName'] ?? null,
-                            'vanityName' => $orgData['vanityName'] ?? null,
-                            'logoUrl' => $orgData['logoV2']['original'] ?? null,
-                            'role' => $element['role'],
-                        ];
-                    }
-                }
-            }
-
-            return $pages;
-        } catch (\Exception $e) {
-            // If we can't get pages, return empty array
-            return [];
-        }
-    }
-
-    /**
-     * Get the platform name.
-     *
-     * @return string
-     */
-    public function getPlatformName(): string
-    {
-        return 'linkedin';
-    }
-
-    /**
-     * Get the default scopes for LinkedIn.
-     *
-     * @return array
-     */
-    public function getDefaultScopes(): array
-    {
-        return [
-            'r_liteprofile',
-            'r_emailaddress',
-            'w_member_social',
-            'r_organization_social',
-            'rw_organization_admin',
-            'w_organization_social',
-        ];
-    }
-
-    /**
-     * Validate the access token.
-     *
-     * @param string $accessToken
-     * @return bool
-     */
-    public function validateAccessToken(string $accessToken): bool
-    {
-        try {
-            $response = $this->client->get('v2/me', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-            ]);
-
-            $data = json_decode($response->getBody()->getContents(), true);
-
-            return isset($data['id']);
-        } catch (\Exception $e) {
-            return false;
-        }
-    }
-
-    /**
-     * Generate a random state parameter for OAuth.
-     *
-     * @return string
-     */
-    protected function generateState(): string
-    {
-        return bin2hex(random_bytes(16));
     }
 }

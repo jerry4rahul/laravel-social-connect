@@ -3,11 +3,10 @@
 namespace VendorName\SocialConnect\Services\Facebook;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
 use VendorName\SocialConnect\Contracts\CommentManagementInterface;
 use VendorName\SocialConnect\Exceptions\CommentException;
-use VendorName\SocialConnect\Models\SocialAccount;
-use VendorName\SocialConnect\Models\SocialComment;
-use VendorName\SocialConnect\Models\SocialPost;
 
 class FacebookCommentService implements CommentManagementInterface
 {
@@ -19,604 +18,319 @@ class FacebookCommentService implements CommentManagementInterface
     protected $client;
 
     /**
-     * The social account instance.
+     * Facebook Graph API version.
      *
-     * @var \VendorName\SocialConnect\Models\SocialAccount
+     * @var string
      */
-    protected $account;
+    protected $graphVersion;
 
     /**
      * Create a new FacebookCommentService instance.
-     *
-     * @param \VendorName\SocialConnect\Models\SocialAccount $account
      */
-    public function __construct(SocialAccount $account)
+    public function __construct()
     {
-        $this->account = $account;
+        $config = Config::get("social-connect.platforms.facebook");
+        $this->graphVersion = $config["graph_version"] ?? "v18.0";
+
         $this->client = new Client([
-            'base_uri' => 'https://graph.facebook.com/v18.0/',
-            'timeout' => 30,
+            "base_uri" => "https://graph.facebook.com/{$this->graphVersion}/",
+            "timeout" => 30,
         ]);
     }
 
     /**
      * Get comments for a specific post.
      *
-     * @param string $postId
-     * @param int $limit
-     * @param string|null $cursor
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $postId The ID of the Facebook Post.
+     * @param int $limit Maximum number of comments to return.
+     * @param string|null $cursor Pagination cursor.
+     * @param string $order Order of comments (
+     * @return array Returns array containing comments and next cursor.
+     * @throws CommentException
      */
-    public function getComments(string $postId, int $limit = 20, ?string $cursor = null): array
+    public function getComments(string $accessToken, string $postId, int $limit = 25, ?string $cursor = null, string $order = "chronological"): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            
             $params = [
-                'fields' => 'id,message,from,created_time,like_count,comment_count,attachment',
-                'limit' => $limit,
+                "fields" => "id,message,from{id,name,picture},created_time,attachment,comment_count,like_count,parent,can_comment,can_like,can_hide,is_hidden,private_reply_conversation",
+                "access_token" => $accessToken,
+                "limit" => $limit,
+                "order" => $order, // chronological or reverse_chronological
             ];
-            
+
             if ($cursor) {
-                $params['after'] = $cursor;
+                $params["after"] = $cursor;
             }
-            
+
             $response = $this->client->get("{$postId}/comments", [
-                'query' => array_merge($params, ['access_token' => $accessToken]),
+                "query" => $params,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['data'])) {
-                throw new CommentException('Failed to retrieve comments from Facebook.');
+
+            if (!isset($data["data"])) {
+                throw new CommentException("Failed to retrieve comments from Facebook.");
             }
-            
-            // Get the post from database
-            $socialPost = SocialPost::where('platform_post_id', $postId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            $comments = [];
-            $nextCursor = $data['paging']['cursors']['after'] ?? null;
-            
-            foreach ($data['data'] as $comment) {
-                $commenterId = $comment['from']['id'] ?? null;
-                $commenterName = $comment['from']['name'] ?? null;
-                
-                // Store in database
-                $socialComment = SocialComment::updateOrCreate(
-                    [
-                        'social_account_id' => $this->account->id,
-                        'platform_comment_id' => $comment['id'],
-                    ],
-                    [
-                        'user_id' => $this->account->user_id,
-                        'social_post_id' => $socialPost ? $socialPost->id : null,
-                        'platform' => 'facebook',
-                        'platform_post_id' => $postId,
-                        'comment' => $comment['message'] ?? '',
-                        'commenter_id' => $commenterId,
-                        'commenter_name' => $commenterName,
-                        'is_reply' => false,
-                        'like_count' => $comment['like_count'] ?? 0,
-                        'reply_count' => $comment['comment_count'] ?? 0,
-                        'metadata' => [
-                            'created_time' => $comment['created_time'] ?? null,
-                            'attachment' => $comment['attachment'] ?? null,
-                        ],
-                    ]
-                );
-                
-                $comments[] = [
-                    'id' => $socialComment->id,
-                    'platform_comment_id' => $comment['id'],
-                    'comment' => $comment['message'] ?? '',
-                    'commenter_id' => $commenterId,
-                    'commenter_name' => $commenterName,
-                    'created_at' => $comment['created_time'] ?? null,
-                    'like_count' => $comment['like_count'] ?? 0,
-                    'reply_count' => $comment['comment_count'] ?? 0,
-                    'attachment' => $comment['attachment'] ?? null,
-                ];
-            }
-            
+
+            $comments = $data["data"];
+            $nextCursor = $data["paging"]["cursors"]["after"] ?? null;
+
+            // Format the output
+            $formattedComments = array_map(function ($comment) {
+                return $this->formatCommentData($comment);
+            }, $comments);
+
             return [
-                'post_id' => $socialPost ? $socialPost->id : null,
-                'platform_post_id' => $postId,
-                'comments' => $comments,
-                'next_cursor' => $nextCursor,
+                "platform" => "facebook",
+                "post_id" => $postId,
+                "comments" => $formattedComments,
+                "next_cursor" => $nextCursor,
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to get comments from Facebook: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to get Facebook comments: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Get replies to a specific comment.
      *
-     * @param string $commentId
-     * @param int $limit
-     * @param string|null $cursor
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $commentId The ID of the parent comment.
+     * @param int $limit Maximum number of replies to return.
+     * @param string|null $cursor Pagination cursor.
+     * @return array Returns array containing replies and next cursor.
+     * @throws CommentException
      */
-    public function getCommentReplies(string $commentId, int $limit = 20, ?string $cursor = null): array
+    public function getCommentReplies(string $accessToken, string $commentId, int $limit = 25, ?string $cursor = null): array
     {
-        try {
-            $accessToken = $this->account->access_token;
-            
-            $params = [
-                'fields' => 'id,message,from,created_time,like_count,attachment',
-                'limit' => $limit,
-            ];
-            
-            if ($cursor) {
-                $params['after'] = $cursor;
-            }
-            
-            $response = $this->client->get("{$commentId}/comments", [
-                'query' => array_merge($params, ['access_token' => $accessToken]),
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['data'])) {
-                throw new CommentException('Failed to retrieve comment replies from Facebook.');
-            }
-            
-            // Get the parent comment from database
-            $parentComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            $replies = [];
-            $nextCursor = $data['paging']['cursors']['after'] ?? null;
-            
-            foreach ($data['data'] as $reply) {
-                $commenterId = $reply['from']['id'] ?? null;
-                $commenterName = $reply['from']['name'] ?? null;
-                
-                // Store in database
-                $socialComment = SocialComment::updateOrCreate(
-                    [
-                        'social_account_id' => $this->account->id,
-                        'platform_comment_id' => $reply['id'],
-                    ],
-                    [
-                        'user_id' => $this->account->user_id,
-                        'social_post_id' => $parentComment ? $parentComment->social_post_id : null,
-                        'platform' => 'facebook',
-                        'platform_post_id' => $parentComment ? $parentComment->platform_post_id : null,
-                        'comment' => $reply['message'] ?? '',
-                        'commenter_id' => $commenterId,
-                        'commenter_name' => $commenterName,
-                        'parent_id' => $parentComment ? $parentComment->id : null,
-                        'is_reply' => true,
-                        'like_count' => $reply['like_count'] ?? 0,
-                        'metadata' => [
-                            'created_time' => $reply['created_time'] ?? null,
-                            'attachment' => $reply['attachment'] ?? null,
-                        ],
-                    ]
-                );
-                
-                $replies[] = [
-                    'id' => $socialComment->id,
-                    'platform_comment_id' => $reply['id'],
-                    'comment' => $reply['message'] ?? '',
-                    'commenter_id' => $commenterId,
-                    'commenter_name' => $commenterName,
-                    'created_at' => $reply['created_time'] ?? null,
-                    'like_count' => $reply['like_count'] ?? 0,
-                    'attachment' => $reply['attachment'] ?? null,
-                ];
-            }
-            
-            return [
-                'parent_comment_id' => $parentComment ? $parentComment->id : null,
-                'platform_comment_id' => $commentId,
-                'replies' => $replies,
-                'next_cursor' => $nextCursor,
-            ];
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to get comment replies from Facebook: ' . $e->getMessage());
-        }
+        // Facebook treats replies as comments on the parent comment object
+        return $this->getComments($accessToken, $commentId, $limit, $cursor);
     }
-    
+
     /**
-     * Post a new comment on a post.
+     * Post a new comment on a post or reply to a comment.
      *
-     * @param string $postId
-     * @param string $comment
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $targetId The ID of the Post or parent Comment to comment on.
+     * @param string $comment The text content of the comment.
+     * @param array $options Additional options (e.g., attachment_url).
+     * @return array Returns array with platform_comment_id.
+     * @throws CommentException
      */
-    public function postComment(string $postId, string $comment, array $options = []): array
+    public function postComment(string $accessToken, string $targetId, string $comment, array $options = []): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $params = [
-                'message' => $comment,
-                'access_token' => $accessToken,
+            $payload = [
+                "message" => $comment,
+                "access_token" => $accessToken,
             ];
-            
-            // Add attachment if provided
-            if (isset($options['attachment_url'])) {
-                $params['attachment_url'] = $options['attachment_url'];
+
+            if (isset($options["attachment_url"])) {
+                $payload["attachment_url"] = $options["attachment_url"];
             }
-            
-            $response = $this->client->post("{$postId}/comments", [
-                'form_params' => $params,
+            // Add other options like attachment_id, etc. if needed
+
+            $response = $this->client->post("{$targetId}/comments", [
+                "form_params" => $payload,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new CommentException('Failed to post comment to Facebook.');
+
+            if (!isset($data["id"])) {
+                throw new CommentException("Failed to post comment to Facebook. No comment ID returned.");
             }
-            
-            // Get the post from database
-            $socialPost = SocialPost::where('platform_post_id', $postId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            // Get page details
-            $pageId = $this->getPageId();
-            
-            // Store in database
-            $socialComment = SocialComment::create([
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'social_post_id' => $socialPost ? $socialPost->id : null,
-                'platform' => 'facebook',
-                'platform_comment_id' => $data['id'],
-                'platform_post_id' => $postId,
-                'comment' => $comment,
-                'commenter_id' => $pageId,
-                'commenter_name' => $this->account->name,
-                'is_reply' => false,
-                'metadata' => [
-                    'created_time' => now()->toIso8601String(),
-                    'attachment' => isset($options['attachment_url']) ? ['url' => $options['attachment_url']] : null,
-                ],
-            ]);
-            
+
             return [
-                'success' => true,
-                'comment_id' => $socialComment->id,
-                'platform_comment_id' => $data['id'],
-                'post_id' => $socialPost ? $socialPost->id : null,
-                'platform_post_id' => $postId,
+                "platform" => "facebook",
+                "platform_comment_id" => $data["id"],
+                "target_id" => $targetId,
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to post comment to Facebook: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to post Facebook comment: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Reply to an existing comment.
      *
-     * @param string $commentId
-     * @param string $reply
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $commentId The ID of the comment to reply to.
+     * @param string $reply The text content of the reply.
+     * @param array $options Additional options.
+     * @return array Returns array with platform_comment_id.
+     * @throws CommentException
      */
-    public function replyToComment(string $commentId, string $reply, array $options = []): array
+    public function replyToComment(string $accessToken, string $commentId, string $reply, array $options = []): array
     {
-        try {
-            $accessToken = $this->account->access_token;
-            
-            $params = [
-                'message' => $reply,
-                'access_token' => $accessToken,
-            ];
-            
-            // Add attachment if provided
-            if (isset($options['attachment_url'])) {
-                $params['attachment_url'] = $options['attachment_url'];
-            }
-            
-            $response = $this->client->post("{$commentId}/comments", [
-                'form_params' => $params,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new CommentException('Failed to reply to comment on Facebook.');
-            }
-            
-            // Get the parent comment from database
-            $parentComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            // Get page details
-            $pageId = $this->getPageId();
-            
-            // Store in database
-            $socialComment = SocialComment::create([
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'social_post_id' => $parentComment ? $parentComment->social_post_id : null,
-                'platform' => 'facebook',
-                'platform_comment_id' => $data['id'],
-                'platform_post_id' => $parentComment ? $parentComment->platform_post_id : null,
-                'comment' => $reply,
-                'commenter_id' => $pageId,
-                'commenter_name' => $this->account->name,
-                'parent_id' => $parentComment ? $parentComment->id : null,
-                'is_reply' => true,
-                'metadata' => [
-                    'created_time' => now()->toIso8601String(),
-                    'attachment' => isset($options['attachment_url']) ? ['url' => $options['attachment_url']] : null,
-                ],
-            ]);
-            
-            // Update parent comment reply count
-            if ($parentComment) {
-                $parentComment->increment('reply_count');
-            }
-            
-            return [
-                'success' => true,
-                'comment_id' => $socialComment->id,
-                'platform_comment_id' => $data['id'],
-                'parent_comment_id' => $parentComment ? $parentComment->id : null,
-                'parent_platform_comment_id' => $commentId,
-            ];
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to reply to comment on Facebook: ' . $e->getMessage());
-        }
+        // Replying is the same as posting a comment on the comment object
+        return $this->postComment($accessToken, $commentId, $reply, $options);
     }
-    
+
     /**
      * Like or react to a comment.
      *
-     * @param string $commentId
-     * @param string $reactionType
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $commentId The ID of the comment.
+     * @param string $reactionType The reaction type (e.g., LIKE, LOVE, WOW, HAHA, SAD, ANGRY).
+     * @return bool Returns true on success.
+     * @throws CommentException
      */
-    public function reactToComment(string $commentId, string $reactionType = 'like'): bool
+    public function reactToComment(string $accessToken, string $commentId, string $reactionType = "LIKE"): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
+            $payload = [
+                "type" => strtoupper($reactionType),
+                "access_token" => $accessToken,
+            ];
+
             $response = $this->client->post("{$commentId}/likes", [
-                'query' => ['access_token' => $accessToken],
+                "form_params" => $payload,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to like comment on Facebook.');
-            }
-            
-            // Update in database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment) {
-                $socialComment->increment('like_count');
-                
-                // Update reactions in metadata
-                $metadata = $socialComment->metadata ?? [];
-                $reactions = $metadata['reactions'] ?? [];
-                $reactions[$reactionType] = ($reactions[$reactionType] ?? 0) + 1;
-                $metadata['reactions'] = $reactions;
-                
-                $socialComment->update([
-                    'metadata' => $metadata,
-                ]);
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to like comment on Facebook: ' . $e->getMessage());
+
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to react to Facebook comment: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Remove a reaction from a comment.
      *
-     * @param string $commentId
-     * @param string $reactionType
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $commentId The ID of the comment.
+     * @param string $reactionType (Optional) Specify reaction type if needed, otherwise removes LIKE.
+     * @return bool Returns true on success.
+     * @throws CommentException
      */
-    public function removeCommentReaction(string $commentId, string $reactionType = 'like'): bool
+    public function removeCommentReaction(string $accessToken, string $commentId, string $reactionType = "LIKE"): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
+            $payload = [
+                "access_token" => $accessToken,
+            ];
+            // Note: Removing specific reactions other than LIKE might not be directly supported or needed.
+            // The DELETE request typically removes the user's LIKE reaction.
+
             $response = $this->client->delete("{$commentId}/likes", [
-                'query' => ['access_token' => $accessToken],
+                "query" => $payload,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to unlike comment on Facebook.');
-            }
-            
-            // Update in database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment && $socialComment->like_count > 0) {
-                $socialComment->decrement('like_count');
-                
-                // Update reactions in metadata
-                $metadata = $socialComment->metadata ?? [];
-                $reactions = $metadata['reactions'] ?? [];
-                
-                if (isset($reactions[$reactionType]) && $reactions[$reactionType] > 0) {
-                    $reactions[$reactionType]--;
-                    $metadata['reactions'] = $reactions;
-                    
-                    $socialComment->update([
-                        'metadata' => $metadata,
-                    ]);
-                }
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to unlike comment on Facebook: ' . $e->getMessage());
+
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to remove reaction from Facebook comment: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Delete a comment.
      *
-     * @param string $commentId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $commentId The ID of the comment to delete.
+     * @return bool Returns true on success.
+     * @throws CommentException
      */
-    public function deleteComment(string $commentId): bool
+    public function deleteComment(string $accessToken, string $commentId): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
             $response = $this->client->delete($commentId, [
-                'query' => ['access_token' => $accessToken],
+                "query" => [
+                    "access_token" => $accessToken,
+                ],
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to delete comment on Facebook.');
-            }
-            
-            // Delete from database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment) {
-                // If this is a reply, decrement parent's reply count
-                if ($socialComment->is_reply && $socialComment->parent_id) {
-                    $parentComment = SocialComment::find($socialComment->parent_id);
-                    
-                    if ($parentComment && $parentComment->reply_count > 0) {
-                        $parentComment->decrement('reply_count');
-                    }
-                }
-                
-                $socialComment->delete();
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to delete comment on Facebook: ' . $e->getMessage());
+
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to delete Facebook comment: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Hide a comment.
      *
-     * @param string $commentId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $commentId The ID of the comment to hide.
+     * @return bool Returns true on success.
+     * @throws CommentException
      */
-    public function hideComment(string $commentId): bool
+    public function hideComment(string $accessToken, string $commentId): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->post("{$commentId}/hide", [
-                'query' => [
-                    'access_token' => $accessToken,
-                    'hide' => true,
+            $response = $this->client->post($commentId, [
+                "form_params" => [
+                    "is_hidden" => "true",
+                    "access_token" => $accessToken,
                 ],
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to hide comment on Facebook.');
-            }
-            
-            // Update in database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment) {
-                $socialComment->update([
-                    'is_hidden' => true,
-                ]);
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to hide comment on Facebook: ' . $e->getMessage());
+
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to hide Facebook comment: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Unhide a comment.
      *
-     * @param string $commentId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param string $accessToken The page/user access token.
+     * @param string $commentId The ID of the comment to unhide.
+     * @return bool Returns true on success.
+     * @throws CommentException
      */
-    public function unhideComment(string $commentId): bool
+    public function unhideComment(string $accessToken, string $commentId): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->post("{$commentId}/hide", [
-                'query' => [
-                    'access_token' => $accessToken,
-                    'hide' => false,
+            $response = $this->client->post($commentId, [
+                "form_params" => [
+                    "is_hidden" => "false",
+                    "access_token" => $accessToken,
                 ],
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || !$data['success']) {
-                throw new CommentException('Failed to unhide comment on Facebook.');
-            }
-            
-            // Update in database
-            $socialComment = SocialComment::where('platform_comment_id', $commentId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialComment) {
-                $socialComment->update([
-                    'is_hidden' => false,
-                ]);
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new CommentException('Failed to unhide comment on Facebook: ' . $e->getMessage());
+
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new CommentException("Failed to unhide Facebook comment: " . $e->getMessage());
         }
     }
-    
+
     /**
-     * Get the page ID from the account metadata.
+     * Helper function to format comment data consistently.
      *
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\CommentException
+     * @param array $comment Raw comment data from API.
+     * @return array Formatted comment data.
      */
-    protected function getPageId(): string
+    protected function formatCommentData(array $comment): array
     {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['page_id'])) {
-            return $metadata['page_id'];
-        }
-        
-        throw new CommentException('Facebook page ID not found in account metadata.');
+        return [
+            "platform_comment_id" => $comment["id"],
+            "message" => $comment["message"] ?? null,
+            "from" => [
+                "id" => $comment["from"]["id"] ?? null,
+                "name" => $comment["from"]["name"] ?? null,
+                "avatar" => $comment["from"]["picture"]["data"]["url"] ?? null,
+            ],
+            "created_time" => $comment["created_time"] ?? null,
+            "attachment" => $comment["attachment"] ?? null,
+            "comment_count" => $comment["comment_count"] ?? 0,
+            "like_count" => $comment["like_count"] ?? 0,
+            "parent_id" => $comment["parent"]["id"] ?? null,
+            "can_comment" => $comment["can_comment"] ?? false,
+            "can_like" => $comment["can_like"] ?? false,
+            "can_hide" => $comment["can_hide"] ?? false,
+            "is_hidden" => $comment["is_hidden"] ?? false,
+            "private_reply_conversation_id" => $comment["private_reply_conversation"]["id"] ?? null,
+        ];
     }
 }

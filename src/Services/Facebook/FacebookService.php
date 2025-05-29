@@ -3,6 +3,9 @@
 namespace VendorName\SocialConnect\Services\Facebook;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\URL;
 use VendorName\SocialConnect\Contracts\SocialPlatformInterface;
 use VendorName\SocialConnect\Exceptions\AuthenticationException;
 
@@ -16,278 +19,223 @@ class FacebookService implements SocialPlatformInterface
     protected $client;
 
     /**
-     * The client ID.
+     * Facebook Graph API version.
+     *
+     * @var string
+     */
+    protected $graphVersion;
+
+    /**
+     * Facebook Client ID.
      *
      * @var string
      */
     protected $clientId;
 
     /**
-     * The client secret.
+     * Facebook Client Secret.
      *
      * @var string
      */
     protected $clientSecret;
 
     /**
-     * The redirect URL.
+     * Facebook Redirect URI.
      *
      * @var string
      */
-    protected $redirectUrl;
+    protected $redirectUri;
+
+    /**
+     * Required scopes.
+     *
+     * @var array
+     */
+    protected $scopes;
 
     /**
      * Create a new FacebookService instance.
-     *
-     * @param string $clientId
-     * @param string $clientSecret
-     * @param string|null $redirectUrl
      */
-    public function __construct(string $clientId, string $clientSecret, string $redirectUrl = null)
+    public function __construct()
     {
-        $this->clientId = $clientId;
-        $this->clientSecret = $clientSecret;
-        $this->redirectUrl = $redirectUrl;
+        $config = Config::get("social-connect.platforms.facebook");
+
+        if (!isset($config["client_id"], $config["client_secret"], $config["redirect"])) {
+            throw new AuthenticationException("Facebook client ID, client secret, or redirect URI is not configured.");
+        }
+
+        $this->clientId = $config["client_id"];
+        $this->clientSecret = $config["client_secret"];
+        $this->redirectUri = $config["redirect"];
+        $this->scopes = $config["scopes"] ?? [];
+        $this->graphVersion = $config["graph_version"] ?? "v18.0";
+
         $this->client = new Client([
-            'base_uri' => 'https://graph.facebook.com/v18.0/',
-            'timeout' => 30,
+            "base_uri" => "https://graph.facebook.com/{$this->graphVersion}/",
+            "timeout" => 30,
         ]);
     }
 
     /**
-     * Get the authorization URL for Facebook.
+     * Get the authentication redirect URL.
      *
-     * @param array $scopes
-     * @param string $redirectUrl
+     * @param array $params Optional parameters.
      * @return string
      */
-    public function getAuthorizationUrl(array $scopes = [], string $redirectUrl = null): string
+    public function getRedirectUrl(array $params = []): string
     {
-        $scopes = count($scopes) > 0 ? $scopes : $this->getDefaultScopes();
-        $redirectUrl = $redirectUrl ?: $this->redirectUrl;
+        $state = $params["state"] ?? bin2hex(random_bytes(16));
+        session(["social_connect_state" => $state]);
 
-        $params = [
-            'client_id' => $this->clientId,
-            'redirect_uri' => $redirectUrl,
-            'scope' => implode(',', $scopes),
-            'response_type' => 'code',
-            'state' => $this->generateState(),
-        ];
+        $query = http_build_query([
+            "client_id" => $this->clientId,
+            "redirect_uri" => $this->redirectUri,
+            "scope" => implode(",", $this->scopes),
+            "response_type" => "code",
+            "state" => $state,
+        ]);
 
-        return 'https://www.facebook.com/v18.0/dialog/oauth?' . http_build_query($params);
+        return "https://www.facebook.com/{$this->graphVersion}/dialog/oauth?" . $query;
     }
 
     /**
-     * Handle the callback from Facebook and retrieve the access token.
+     * Handle the OAuth callback and exchange code for token.
      *
-     * @param string $code
-     * @param string $redirectUrl
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
+     * @param string $code The authorization code from callback.
+     * @param string|null $state The state parameter from callback for validation.
+     * @return array Returns an array containing token information and basic user profile.
+     * @throws AuthenticationException
      */
-    public function handleCallback(string $code, string $redirectUrl = null): array
+    public function exchangeCodeForToken(string $code, ?string $state = null): array
     {
-        $redirectUrl = $redirectUrl ?: $this->redirectUrl;
+        // Validate state if provided
+        if ($state !== null) {
+            $sessionState = session()->pull("social_connect_state");
+            if (!$sessionState || $sessionState !== $state) {
+                throw new AuthenticationException("Invalid OAuth state.");
+            }
+        }
 
         try {
-            $response = $this->client->post('oauth/access_token', [
-                'form_params' => [
-                    'client_id' => $this->clientId,
-                    'client_secret' => $this->clientSecret,
-                    'code' => $code,
-                    'redirect_uri' => $redirectUrl,
+            // Exchange code for access token
+            $response = $this->client->get("oauth/access_token", [
+                "query" => [
+                    "client_id" => $this->clientId,
+                    "client_secret" => $this->clientSecret,
+                    "redirect_uri" => $this->redirectUri,
+                    "code" => $code,
                 ],
             ]);
 
-            $data = json_decode($response->getBody()->getContents(), true);
+            $tokenData = json_decode($response->getBody()->getContents(), true);
 
-            if (!isset($data['access_token'])) {
-                throw new AuthenticationException('Failed to retrieve access token from Facebook.');
+            if (!isset($tokenData["access_token"])) {
+                throw new AuthenticationException("Failed to retrieve access token from Facebook.");
             }
 
-            // Get long-lived token
-            $longLivedToken = $this->getLongLivedToken($data['access_token']);
+            $accessToken = $tokenData["access_token"];
+            $expiresIn = $tokenData["expires_in"] ?? null;
 
-            // Get user profile
-            $profile = $this->getUserProfile($longLivedToken['access_token']);
+            // Get user profile information
+            $profileData = $this->getUserProfile($accessToken);
+
+            // Optionally exchange for a long-lived token
+            $longLivedTokenData = $this->exchangeForLongLivedToken($accessToken);
+            $accessToken = $longLivedTokenData["access_token"] ?? $accessToken;
+            $expiresIn = $longLivedTokenData["expires_in"] ?? $expiresIn;
 
             return [
-                'access_token' => $longLivedToken['access_token'],
-                'refresh_token' => null, // Facebook doesn't use refresh tokens for user tokens
-                'expires_in' => $longLivedToken['expires_in'],
-                'token_type' => 'bearer',
-                'profile' => $profile,
+                "platform" => "facebook",
+                "access_token" => $accessToken,
+                "refresh_token" => null, // Facebook uses long-lived tokens, no standard refresh token
+                "expires_in" => $expiresIn,
+                "platform_user_id" => $profileData["id"],
+                "name" => $profileData["name"] ?? null,
+                "email" => $profileData["email"] ?? null,
+                "avatar" => $profileData["picture"]["data"]["url"] ?? null,
+                "raw_token_data" => $tokenData, // Original short-lived token data
+                "raw_profile_data" => $profileData, // Raw profile data
             ];
-        } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to authenticate with Facebook: ' . $e->getMessage());
+        } catch (GuzzleException | \Exception $e) {
+            throw new AuthenticationException("Facebook authentication failed: " . $e->getMessage());
         }
     }
 
     /**
-     * Exchange a short-lived token for a long-lived token.
+     * Get user profile information using an access token.
      *
      * @param string $accessToken
      * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
-     */
-    protected function getLongLivedToken(string $accessToken): array
-    {
-        try {
-            $response = $this->client->get('oauth/access_token', [
-                'query' => [
-                    'grant_type' => 'fb_exchange_token',
-                    'client_id' => $this->clientId,
-                    'client_secret' => $this->clientSecret,
-                    'fb_exchange_token' => $accessToken,
-                ],
-            ]);
-
-            $data = json_decode($response->getBody()->getContents(), true);
-
-            if (!isset($data['access_token'])) {
-                throw new AuthenticationException('Failed to retrieve long-lived token from Facebook.');
-            }
-
-            return [
-                'access_token' => $data['access_token'],
-                'expires_in' => $data['expires_in'] ?? 5184000, // Default to 60 days
-            ];
-        } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to exchange token with Facebook: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Refresh the access token using the refresh token.
-     * Note: Facebook doesn't use refresh tokens for user tokens, but we implement this for interface compatibility.
-     *
-     * @param string $refreshToken
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
-     */
-    public function refreshAccessToken(string $refreshToken): array
-    {
-        throw new AuthenticationException('Facebook does not support refreshing user access tokens. Use page tokens instead.');
-    }
-
-    /**
-     * Get the user profile from Facebook.
-     *
-     * @param string $accessToken
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
+     * @throws AuthenticationException
      */
     public function getUserProfile(string $accessToken): array
     {
         try {
-            $response = $this->client->get('me', [
-                'query' => [
-                    'fields' => 'id,name,email,picture.type(large)',
-                    'access_token' => $accessToken,
+            $response = $this->client->get("me", [
+                "query" => [
+                    "fields" => "id,name,email,picture.type(large)",
+                    "access_token" => $accessToken,
                 ],
             ]);
 
-            $profile = json_decode($response->getBody()->getContents(), true);
+            $profileData = json_decode($response->getBody()->getContents(), true);
 
-            // Get user pages if available
-            $pages = $this->getUserPages($accessToken);
+            if (!isset($profileData["id"])) {
+                throw new AuthenticationException("Failed to retrieve user profile from Facebook.");
+            }
 
-            return [
-                'id' => $profile['id'],
-                'name' => $profile['name'],
-                'email' => $profile['email'] ?? null,
-                'avatar' => $profile['picture']['data']['url'] ?? null,
-                'pages' => $pages,
-            ];
-        } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to get user profile from Facebook: ' . $e->getMessage());
+            return $profileData;
+        } catch (GuzzleException $e) {
+            throw new AuthenticationException("Failed to get Facebook user profile: " . $e->getMessage());
         }
     }
 
     /**
-     * Get the user's Facebook pages.
+     * Exchange a short-lived access token for a long-lived one.
      *
-     * @param string $accessToken
-     * @return array
+     * @param string $accessToken Short-lived access token.
+     * @return array Long-lived token data.
+     * @throws AuthenticationException
      */
-    public function getUserPages(string $accessToken): array
+    protected function exchangeForLongLivedToken(string $accessToken): array
     {
         try {
-            $response = $this->client->get('me/accounts', [
-                'query' => [
-                    'access_token' => $accessToken,
+            $response = $this->client->get("oauth/access_token", [
+                "query" => [
+                    "grant_type" => "fb_exchange_token",
+                    "client_id" => $this->clientId,
+                    "client_secret" => $this->clientSecret,
+                    "fb_exchange_token" => $accessToken,
                 ],
             ]);
 
-            $data = json_decode($response->getBody()->getContents(), true);
+            $tokenData = json_decode($response->getBody()->getContents(), true);
 
-            return $data['data'] ?? [];
-        } catch (\Exception $e) {
-            // If we can't get pages, return empty array
+            if (!isset($tokenData["access_token"])) {
+                // It might fail if the token is already long-lived or other issues
+                // Return empty array, the original token will be used
+                return [];
+            }
+
+            return $tokenData;
+        } catch (GuzzleException $e) {
+            // Log the error but don't fail the whole process, return empty array
+            report(new AuthenticationException("Failed to exchange for long-lived Facebook token: " . $e->getMessage()));
             return [];
         }
     }
 
     /**
-     * Get the platform name.
+     * Refresh an access token (Not applicable for Facebook's standard flow).
      *
-     * @return string
-     */
-    public function getPlatformName(): string
-    {
-        return 'facebook';
-    }
-
-    /**
-     * Get the default scopes for Facebook.
-     *
+     * @param string $refreshToken
      * @return array
+     * @throws AuthenticationException
      */
-    public function getDefaultScopes(): array
+    public function refreshToken(string $refreshToken): array
     {
-        return [
-            'email',
-            'public_profile',
-            'pages_show_list',
-            'pages_read_engagement',
-            'pages_manage_posts',
-            'pages_manage_metadata',
-            'pages_read_user_content',
-            'pages_manage_engagement',
-        ];
-    }
-
-    /**
-     * Validate the access token.
-     *
-     * @param string $accessToken
-     * @return bool
-     */
-    public function validateAccessToken(string $accessToken): bool
-    {
-        try {
-            $response = $this->client->get('debug_token', [
-                'query' => [
-                    'input_token' => $accessToken,
-                    'access_token' => $this->clientId . '|' . $this->clientSecret,
-                ],
-            ]);
-
-            $data = json_decode($response->getBody()->getContents(), true);
-
-            return isset($data['data']) && $data['data']['is_valid'] === true;
-        } catch (\Exception $e) {
-            return false;
-        }
-    }
-
-    /**
-     * Generate a random state parameter for OAuth.
-     *
-     * @return string
-     */
-    protected function generateState(): string
-    {
-        return bin2hex(random_bytes(16));
+        // Facebook uses long-lived tokens and doesn't have a standard refresh token flow like others.
+        // Token validity needs to be checked and user re-authenticated if expired.
+        throw new AuthenticationException("Facebook does not support standard token refresh via refresh tokens.");
     }
 }

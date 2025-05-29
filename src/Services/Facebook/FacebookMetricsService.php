@@ -3,11 +3,10 @@
 namespace VendorName\SocialConnect\Services\Facebook;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
 use VendorName\SocialConnect\Contracts\MetricsInterface;
 use VendorName\SocialConnect\Exceptions\MetricsException;
-use VendorName\SocialConnect\Models\SocialAccount;
-use VendorName\SocialConnect\Models\SocialMetric;
-use VendorName\SocialConnect\Models\SocialPost;
 
 class FacebookMetricsService implements MetricsInterface
 {
@@ -19,496 +18,219 @@ class FacebookMetricsService implements MetricsInterface
     protected $client;
 
     /**
-     * The social account instance.
+     * Facebook Graph API version.
      *
-     * @var \VendorName\SocialConnect\Models\SocialAccount
+     * @var string
      */
-    protected $account;
+    protected $graphVersion;
 
     /**
      * Create a new FacebookMetricsService instance.
-     *
-     * @param \VendorName\SocialConnect\Models\SocialAccount $account
      */
-    public function __construct(SocialAccount $account)
+    public function __construct()
     {
-        $this->account = $account;
+        $config = Config::get("social-connect.platforms.facebook");
+        $this->graphVersion = $config["graph_version"] ?? "v18.0";
+
         $this->client = new Client([
-            'base_uri' => 'https://graph.facebook.com/v18.0/',
-            'timeout' => 30,
+            "base_uri" => "https://graph.facebook.com/{$this->graphVersion}/",
+            "timeout" => 30,
         ]);
     }
 
     /**
-     * Get account-level metrics.
+     * Get account-level metrics (e.g., for a Facebook Page).
      *
-     * @param string $period
-     * @param array $metrics
+     * @param string $accessToken The access token for the page.
+     * @param string $targetId The ID of the Facebook Page.
+     * @param array $metrics The list of metrics to retrieve (e.g., ["page_fans", "page_impressions"]).
+     * @param string|null $since Start date (YYYY-MM-DD or Unix timestamp).
+     * @param string|null $until End date (YYYY-MM-DD or Unix timestamp).
+     * @param string $period Aggregation period (
      * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MetricsException
+     * @throws MetricsException
      */
-    public function getAccountMetrics(string $period = 'last_30_days', array $metrics = []): array
+    public function getAccountMetrics(string $accessToken, string $targetId, array $metrics, ?string $since = null, ?string $until = null, string $period = "day"): array
     {
         try {
-            $pageId = $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-            
-            // Default metrics if none provided
-            if (empty($metrics)) {
-                $metrics = [
-                    'page_impressions',
-                    'page_impressions_unique',
-                    'page_engaged_users',
-                    'page_post_engagements',
-                    'page_fans',
-                    'page_fan_adds',
-                    'page_views_total',
-                ];
+            $params = [
+                "metric" => implode(",", $metrics),
+                "period" => $period,
+                "access_token" => $accessToken,
+            ];
+
+            if ($since) {
+                $params["since"] = $since;
             }
-            
-            // Convert period to date range
-            $dateRange = $this->convertPeriodToDateRange($period);
-            
-            // Get insights
-            $response = $this->client->get("{$pageId}/insights", [
-                'query' => [
-                    'metric' => implode(',', $metrics),
-                    'period' => 'day',
-                    'since' => $dateRange['start'],
-                    'until' => $dateRange['end'],
-                    'access_token' => $accessToken,
-                ],
+            if ($until) {
+                $params["until"] = $until;
+            }
+
+            $response = $this->client->get("{$targetId}/insights", [
+                "query" => $params,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['data'])) {
-                throw new MetricsException('Failed to retrieve account metrics from Facebook.');
+
+            if (!isset($data["data"])) {
+                throw new MetricsException("Failed to retrieve account metrics from Facebook.");
             }
-            
+
+            // Process the data into a more usable format
             $results = [];
-            
-            foreach ($data['data'] as $metricData) {
-                $metricName = $metricData['name'];
-                $metricValues = $metricData['values'];
-                
+            foreach ($data["data"] as $metricData) {
+                $metricName = $metricData["name"];
                 $results[$metricName] = [
-                    'values' => $metricValues,
-                    'period' => $period,
-                    'title' => $this->getMetricTitle($metricName),
-                    'description' => $this->getMetricDescription($metricName),
+                    "name" => $metricName,
+                    "period" => $metricData["period"],
+                    "title" => $metricData["title"] ?? null,
+                    "description" => $metricData["description"] ?? null,
+                    "values" => $metricData["values"] ?? [],
                 ];
-                
-                // Store in database
-                $this->storeAccountMetric($metricName, $metricValues, $dateRange['start_date'], $dateRange['end_date']);
             }
-            
-            return $results;
-        } catch (\Exception $e) {
-            throw new MetricsException('Failed to get account metrics from Facebook: ' . $e->getMessage());
+
+            return [
+                "platform" => "facebook",
+                "target_id" => $targetId,
+                "metrics" => $results,
+                "raw_response" => $data, // Include raw response for flexibility
+            ];
+        } catch (GuzzleException $e) {
+            throw new MetricsException("Failed to get Facebook account metrics: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Get post-level metrics.
      *
-     * @param string $postId
-     * @param array $metrics
+     * @param string $accessToken The access token for the page/user.
+     * @param string $postId The ID of the Facebook Post.
+     * @param array $metrics The list of metrics to retrieve (e.g., ["post_impressions", "post_engaged_users"]).
      * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MetricsException
+     * @throws MetricsException
      */
-    public function getPostMetrics(string $postId, array $metrics = []): array
+    public function getPostMetrics(string $accessToken, string $postId, array $metrics): array
     {
         try {
-            $accessToken = $this->getPageAccessToken($this->getDefaultPageId());
-            
-            // Default metrics if none provided
-            if (empty($metrics)) {
-                $metrics = [
-                    'post_impressions',
-                    'post_impressions_unique',
-                    'post_engaged_users',
-                    'post_reactions_by_type_total',
-                    'post_clicks',
-                    'post_video_views',
-                ];
-            }
-            
-            // Get insights
-            $response = $this->client->get("{$postId}/insights", [
-                'query' => [
-                    'metric' => implode(',', $metrics),
-                    'access_token' => $accessToken,
-                ],
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['data'])) {
-                throw new MetricsException('Failed to retrieve post metrics from Facebook.');
-            }
-            
-            $results = [];
-            
-            foreach ($data['data'] as $metricData) {
-                $metricName = $metricData['name'];
-                $metricValues = $metricData['values'];
-                
-                $results[$metricName] = [
-                    'values' => $metricValues,
-                    'title' => $this->getMetricTitle($metricName),
-                    'description' => $this->getMetricDescription($metricName),
-                ];
-                
-                // Store in database
-                $this->storePostMetric($postId, $metricName, $metricValues);
-            }
-            
-            return $results;
-        } catch (\Exception $e) {
-            throw new MetricsException('Failed to get post metrics from Facebook: ' . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Get metrics for multiple posts.
-     *
-     * @param array $postIds
-     * @param array $metrics
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MetricsException
-     */
-    public function getBulkPostMetrics(array $postIds, array $metrics = []): array
-    {
-        $results = [];
-        
-        foreach ($postIds as $postId) {
-            $results[$postId] = $this->getPostMetrics($postId, $metrics);
-        }
-        
-        return $results;
-    }
-    
-    /**
-     * Get audience demographics.
-     *
-     * @param array $dimensions
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MetricsException
-     */
-    public function getAudienceDemographics(array $dimensions = []): array
-    {
-        try {
-            $pageId = $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-            
-            // Default dimensions if none provided
-            if (empty($dimensions)) {
-                $dimensions = [
-                    'age',
-                    'gender',
-                    'country',
-                ];
-            }
-            
-            $results = [];
-            
-            foreach ($dimensions as $dimension) {
-                $metric = "page_fans_{$dimension}";
-                
-                $response = $this->client->get("{$pageId}/insights", [
-                    'query' => [
-                        'metric' => $metric,
-                        'access_token' => $accessToken,
-                    ],
-                ]);
-                
-                $data = json_decode($response->getBody()->getContents(), true);
-                
-                if (isset($data['data'][0]['values'][0]['value'])) {
-                    $results[$dimension] = $data['data'][0]['values'][0]['value'];
-                    
-                    // Store in database
-                    $this->storeAccountMetric(
-                        "audience_{$dimension}",
-                        $data['data'][0]['values'],
-                        now()->subDay(),
-                        now()
-                    );
-                }
-            }
-            
-            return $results;
-        } catch (\Exception $e) {
-            throw new MetricsException('Failed to get audience demographics from Facebook: ' . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Get account growth metrics over time.
-     *
-     * @param string $startDate
-     * @param string $endDate
-     * @param string $interval
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MetricsException
-     */
-    public function getAccountGrowth(string $startDate, string $endDate, string $interval = 'day'): array
-    {
-        try {
-            $pageId = $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-            
-            $metrics = [
-                'page_fans',
-                'page_fan_adds',
-                'page_fan_removes',
+            $params = [
+                "metric" => implode(",", $metrics),
+                "access_token" => $accessToken,
             ];
-            
-            $response = $this->client->get("{$pageId}/insights", [
-                'query' => [
-                    'metric' => implode(',', $metrics),
-                    'period' => $interval,
-                    'since' => $startDate,
-                    'until' => $endDate,
-                    'access_token' => $accessToken,
+
+            $response = $this->client->get("{$postId}/insights", [
+                "query" => $params,
+            ]);
+
+            $data = json_decode($response->getBody()->getContents(), true);
+
+            if (!isset($data["data"])) {
+                throw new MetricsException("Failed to retrieve post metrics from Facebook.");
+            }
+
+            // Process the data
+            $results = [];
+            foreach ($data["data"] as $metricData) {
+                $metricName = $metricData["name"];
+                // Post metrics often return a single value for the lifetime
+                $value = null;
+                if (isset($metricData["values"][0]["value"])) {
+                    $value = $metricData["values"][0]["value"];
+                }
+                $results[$metricName] = [
+                    "name" => $metricName,
+                    "title" => $metricData["title"] ?? null,
+                    "description" => $metricData["description"] ?? null,
+                    "value" => $value,
+                ];
+            }
+
+            return [
+                "platform" => "facebook",
+                "post_id" => $postId,
+                "metrics" => $results,
+                "raw_response" => $data,
+            ];
+        } catch (GuzzleException $e) {
+            throw new MetricsException("Failed to get Facebook post metrics: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Get audience demographics (Example: Page fans by country).
+     *
+     * @param string $accessToken The access token for the page.
+     * @param string $targetId The ID of the Facebook Page.
+     * @param string $metric The specific demographic metric (e.g., "page_fans_country").
+     * @param string $period Aggregation period (usually "lifetime").
+     * @return array
+     * @throws MetricsException
+     */
+    public function getAudienceDemographics(string $accessToken, string $targetId, string $metric = "page_fans_country", string $period = "lifetime"): array
+    {
+        // Note: Demographics are often retrieved via getAccountMetrics with specific metric names.
+        // This is a convenience method for a common use case.
+        try {
+            $response = $this->client->get("{$targetId}/insights/{$metric}", [
+                "query" => [
+                    "period" => $period,
+                    "access_token" => $accessToken,
                 ],
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['data'])) {
-                throw new MetricsException('Failed to retrieve account growth metrics from Facebook.');
+
+            if (!isset($data["data"][0]["values"][0]["value"])) {
+                throw new MetricsException("Failed to retrieve audience demographics from Facebook.");
             }
-            
-            $results = [];
-            
-            foreach ($data['data'] as $metricData) {
-                $metricName = $metricData['name'];
-                $metricValues = $metricData['values'];
-                
-                $results[$metricName] = [
-                    'values' => $metricValues,
-                    'title' => $this->getMetricTitle($metricName),
-                    'description' => $this->getMetricDescription($metricName),
-                ];
-                
-                // Store in database
-                $this->storeAccountMetric(
-                    $metricName,
-                    $metricValues,
-                    new \DateTime($startDate),
-                    new \DateTime($endDate)
-                );
-            }
-            
-            return $results;
-        } catch (\Exception $e) {
-            throw new MetricsException('Failed to get account growth metrics from Facebook: ' . $e->getMessage());
+
+            return [
+                "platform" => "facebook",
+                "target_id" => $targetId,
+                "metric" => $metric,
+                "demographics" => $data["data"][0]["values"][0]["value"], // Typically an object with country codes as keys
+                "raw_response" => $data,
+            ];
+        } catch (GuzzleException $e) {
+            throw new MetricsException("Failed to get Facebook audience demographics: " . $e->getMessage());
         }
     }
-    
+
     /**
-     * Store account-level metric in the database.
+     * Get historical data for a specific metric.
      *
-     * @param string $metricType
-     * @param array $metricValue
-     * @param \DateTime $periodStart
-     * @param \DateTime $periodEnd
-     * @return \VendorName\SocialConnect\Models\SocialMetric
-     */
-    protected function storeAccountMetric(string $metricType, array $metricValue, \DateTime $periodStart, \DateTime $periodEnd): SocialMetric
-    {
-        return SocialMetric::updateOrCreate(
-            [
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'metric_type' => $metricType,
-                'period_start' => $periodStart,
-                'period_end' => $periodEnd,
-            ],
-            [
-                'metric_value' => $metricValue,
-            ]
-        );
-    }
-    
-    /**
-     * Store post-level metric in the database.
-     *
-     * @param string $postId
-     * @param string $metricType
-     * @param array $metricValue
-     * @return \VendorName\SocialConnect\Models\SocialMetric
-     */
-    protected function storePostMetric(string $postId, string $metricType, array $metricValue): SocialMetric
-    {
-        $socialPost = SocialPost::where('platform_post_id', $postId)
-            ->where('platform', 'facebook')
-            ->first();
-        
-        if (!$socialPost) {
-            return new SocialMetric();
-        }
-        
-        return SocialMetric::updateOrCreate(
-            [
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'social_post_id' => $socialPost->id,
-                'metric_type' => $metricType,
-            ],
-            [
-                'metric_value' => $metricValue,
-                'period_start' => now()->subDays(30),
-                'period_end' => now(),
-            ]
-        );
-    }
-    
-    /**
-     * Convert period string to date range.
-     *
-     * @param string $period
+     * @param string $accessToken The access token for the page.
+     * @param string $targetId The ID of the Facebook Page.
+     * @param string $metric The metric to retrieve (e.g., "page_fans").
+     * @param string $since Start date (YYYY-MM-DD or Unix timestamp).
+     * @param string $until End date (YYYY-MM-DD or Unix timestamp).
+     * @param string $period Aggregation period (e.g., "day", "week", "month").
      * @return array
+     * @throws MetricsException
      */
-    protected function convertPeriodToDateRange(string $period): array
+    public function getHistoricalData(string $accessToken, string $targetId, string $metric, string $since, string $until, string $period = "day"): array
     {
-        $endDate = now();
-        $startDate = null;
-        
-        switch ($period) {
-            case 'today':
-                $startDate = now()->startOfDay();
-                break;
-            case 'yesterday':
-                $startDate = now()->subDay()->startOfDay();
-                $endDate = now()->subDay()->endOfDay();
-                break;
-            case 'last_7_days':
-                $startDate = now()->subDays(7);
-                break;
-            case 'last_14_days':
-                $startDate = now()->subDays(14);
-                break;
-            case 'last_30_days':
-                $startDate = now()->subDays(30);
-                break;
-            case 'last_90_days':
-                $startDate = now()->subDays(90);
-                break;
-            case 'this_month':
-                $startDate = now()->startOfMonth();
-                break;
-            case 'last_month':
-                $startDate = now()->subMonth()->startOfMonth();
-                $endDate = now()->subMonth()->endOfMonth();
-                break;
-            default:
-                $startDate = now()->subDays(30);
-                break;
-        }
-        
-        return [
-            'start' => $startDate->format('Y-m-d'),
-            'end' => $endDate->format('Y-m-d'),
-            'start_date' => $startDate,
-            'end_date' => $endDate,
-        ];
-    }
-    
-    /**
-     * Get the default page ID from the account metadata.
-     *
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\MetricsException
-     */
-    protected function getDefaultPageId(): string
-    {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['pages']) && !empty($metadata['pages'])) {
-            return $metadata['pages'][0]['id'];
-        }
-        
-        throw new MetricsException('No Facebook page found for this account.');
-    }
-    
-    /**
-     * Get the page access token for a specific page.
-     *
-     * @param string $pageId
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\MetricsException
-     */
-    protected function getPageAccessToken(string $pageId): string
-    {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['pages'])) {
-            foreach ($metadata['pages'] as $page) {
-                if ($page['id'] === $pageId) {
-                    return $page['access_token'];
-                }
+        // This is essentially a specific use case of getAccountMetrics
+        try {
+            $metricsResult = $this->getAccountMetrics($accessToken, $targetId, [$metric], $since, $until, $period);
+
+            if (!isset($metricsResult["metrics"][$metric])) {
+                 throw new MetricsException("Failed to retrieve historical data for metric '{$metric}' from Facebook.");
             }
+
+            return [
+                "platform" => "facebook",
+                "target_id" => $targetId,
+                "metric" => $metric,
+                "period" => $period,
+                "since" => $since,
+                "until" => $until,
+                "historical_data" => $metricsResult["metrics"][$metric]["values"],
+                "raw_response" => $metricsResult["raw_response"],
+            ];
+
+        } catch (GuzzleException | MetricsException $e) {
+            // Catch MetricsException from getAccountMetrics as well
+            throw new MetricsException("Failed to get Facebook historical data: " . $e->getMessage());
         }
-        
-        throw new MetricsException('Page access token not found for page ID: ' . $pageId);
-    }
-    
-    /**
-     * Get the human-readable title for a metric.
-     *
-     * @param string $metricName
-     * @return string
-     */
-    protected function getMetricTitle(string $metricName): string
-    {
-        $titles = [
-            'page_impressions' => 'Page Impressions',
-            'page_impressions_unique' => 'Unique Page Impressions',
-            'page_engaged_users' => 'Page Engaged Users',
-            'page_post_engagements' => 'Post Engagements',
-            'page_fans' => 'Page Likes',
-            'page_fan_adds' => 'New Page Likes',
-            'page_fan_removes' => 'Page Unlikes',
-            'page_views_total' => 'Page Views',
-            'post_impressions' => 'Post Impressions',
-            'post_impressions_unique' => 'Unique Post Impressions',
-            'post_engaged_users' => 'Post Engaged Users',
-            'post_reactions_by_type_total' => 'Post Reactions',
-            'post_clicks' => 'Post Clicks',
-            'post_video_views' => 'Video Views',
-        ];
-        
-        return $titles[$metricName] ?? $metricName;
-    }
-    
-    /**
-     * Get the description for a metric.
-     *
-     * @param string $metricName
-     * @return string
-     */
-    protected function getMetricDescription(string $metricName): string
-    {
-        $descriptions = [
-            'page_impressions' => 'The number of times any content from your Page or about your Page entered a person\'s screen.',
-            'page_impressions_unique' => 'The number of people who had any content from your Page or about your Page enter their screen.',
-            'page_engaged_users' => 'The number of people who engaged with your Page.',
-            'page_post_engagements' => 'The number of times people have engaged with your posts through likes, comments and shares.',
-            'page_fans' => 'The total number of people who have liked your Page.',
-            'page_fan_adds' => 'The number of new people who have liked your Page.',
-            'page_fan_removes' => 'The number of people who have unliked your Page.',
-            'page_views_total' => 'The number of times a Page\'s profile has been viewed.',
-            'post_impressions' => 'The number of times your post entered a person\'s screen.',
-            'post_impressions_unique' => 'The number of people who had your post enter their screen.',
-            'post_engaged_users' => 'The number of people who engaged with your post.',
-            'post_reactions_by_type_total' => 'The number of reactions on your post by type.',
-            'post_clicks' => 'The number of clicks on your post.',
-            'post_video_views' => 'The number of times your video was viewed for at least 3 seconds.',
-        ];
-        
-        return $descriptions[$metricName] ?? '';
     }
 }

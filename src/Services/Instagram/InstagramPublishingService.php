@@ -3,445 +3,327 @@
 namespace VendorName\SocialConnect\Services\Instagram;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Storage;
 use VendorName\SocialConnect\Contracts\PublishableInterface;
 use VendorName\SocialConnect\Exceptions\PublishingException;
-use VendorName\SocialConnect\Models\SocialAccount;
-use VendorName\SocialConnect\Models\SocialPost;
 
 class InstagramPublishingService implements PublishableInterface
 {
     /**
-     * The HTTP client instance.
+     * The HTTP client instance for Instagram Graph API.
      *
      * @var \GuzzleHttp\Client
      */
-    protected $client;
+    protected $graphClient;
 
     /**
-     * The social account instance.
+     * Facebook Graph API version (used for Instagram Graph API).
      *
-     * @var \VendorName\SocialConnect\Models\SocialAccount
+     * @var string
      */
-    protected $account;
+    protected $graphVersion;
 
     /**
      * Create a new InstagramPublishingService instance.
-     *
-     * @param \VendorName\SocialConnect\Models\SocialAccount $account
      */
-    public function __construct(SocialAccount $account)
+    public function __construct()
     {
-        $this->account = $account;
-        $this->client = new Client([
-            'base_uri' => 'https://graph.instagram.com/',
-            'timeout' => 30,
+        // Publishing uses the Instagram Graph API (via Facebook Graph API endpoint)
+        $config = Config::get("social-connect.platforms.facebook"); // Use Facebook config for Graph API version
+        $this->graphVersion = $config["graph_version"] ?? "v18.0";
+
+        $this->graphClient = new Client([
+            "base_uri" => "https://graph.facebook.com/{$this->graphVersion}/",
+            "timeout" => 120, // Increased timeout for video uploads
         ]);
     }
 
     /**
-     * Publish a text post to Instagram.
-     * Note: Instagram doesn't support text-only posts, so we'll throw an exception.
+     * Publish a text post (Not directly supported by Instagram API - requires media).
      *
-     * @param string $content
-     * @param array $options
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $targetId Instagram Business Account ID.
+     * @param string $text The text content (used as caption for media).
+     * @param array $options Must include media (image/video path).
      * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @throws PublishingException
      */
-    public function publishText(string $content, array $options = []): array
+    public function publishText(string $accessToken, string $targetId, string $text, array $options = []): array
     {
-        throw new PublishingException('Instagram does not support text-only posts. Please use publishImage or publishVideo instead.');
-    }
-
-    /**
-     * Publish an image post to Instagram.
-     *
-     * @param string $content
-     * @param string|array $mediaUrls
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function publishImage(string $content, $mediaUrls, array $options = []): array
-    {
-        try {
-            $accessToken = $this->account->access_token;
-            $igAccountId = $this->getInstagramAccountId();
-            $mediaUrls = is_array($mediaUrls) ? $mediaUrls : [$mediaUrls];
-
-            // For a single image
-            if (count($mediaUrls) === 1) {
-                // Step 1: Create a container for the image
-                $response = $this->client->post("v18.0/{$igAccountId}/media", [
-                    'form_params' => [
-                        'image_url' => $mediaUrls[0],
-                        'caption' => $content,
-                        'access_token' => $accessToken,
-                    ],
-                ]);
-
-                $data = json_decode($response->getBody()->getContents(), true);
-
-                if (!isset($data['id'])) {
-                    throw new PublishingException('Failed to create media container for Instagram image.');
-                }
-
-                $mediaContainerId = $data['id'];
-
-                // Step 2: Publish the container
-                $publishResponse = $this->client->post("v18.0/{$igAccountId}/media_publish", [
-                    'form_params' => [
-                        'creation_id' => $mediaContainerId,
-                        'access_token' => $accessToken,
-                    ],
-                ]);
-
-                $publishData = json_decode($publishResponse->getBody()->getContents(), true);
-
-                if (!isset($publishData['id'])) {
-                    throw new PublishingException('Failed to publish image to Instagram.');
-                }
-
-                $postId = $publishData['id'];
-            } else {
-                // For multiple images (carousel)
-                $mediaContainerIds = [];
-
-                foreach ($mediaUrls as $mediaUrl) {
-                    $response = $this->client->post("v18.0/{$igAccountId}/media", [
-                        'form_params' => [
-                            'image_url' => $mediaUrl,
-                            'is_carousel_item' => 'true',
-                            'access_token' => $accessToken,
-                        ],
-                    ]);
-
-                    $data = json_decode($response->getBody()->getContents(), true);
-
-                    if (!isset($data['id'])) {
-                        throw new PublishingException('Failed to create media container for Instagram carousel item.');
-                    }
-
-                    $mediaContainerIds[] = $data['id'];
-                }
-
-                // Create a carousel container
-                $response = $this->client->post("v18.0/{$igAccountId}/media", [
-                    'form_params' => [
-                        'media_type' => 'CAROUSEL',
-                        'children' => implode(',', $mediaContainerIds),
-                        'caption' => $content,
-                        'access_token' => $accessToken,
-                    ],
-                ]);
-
-                $data = json_decode($response->getBody()->getContents(), true);
-
-                if (!isset($data['id'])) {
-                    throw new PublishingException('Failed to create carousel container for Instagram.');
-                }
-
-                $carouselContainerId = $data['id'];
-
-                // Publish the carousel
-                $publishResponse = $this->client->post("v18.0/{$igAccountId}/media_publish", [
-                    'form_params' => [
-                        'creation_id' => $carouselContainerId,
-                        'access_token' => $accessToken,
-                    ],
-                ]);
-
-                $publishData = json_decode($publishResponse->getBody()->getContents(), true);
-
-                if (!isset($publishData['id'])) {
-                    throw new PublishingException('Failed to publish carousel to Instagram.');
-                }
-
-                $postId = $publishData['id'];
-            }
-
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $postId,
-                'content' => $content,
-                'media_urls' => $mediaUrls,
-                'post_type' => 'image',
-                'status' => 'published',
-                'published_at' => now(),
-            ]);
-
-            // Get post URL
-            $postData = $this->getPostDetails($postId, $accessToken);
-            $post->update([
-                'post_url' => $postData['permalink'] ?? null,
-            ]);
-
-            return [
-                'id' => $postId,
-                'platform' => 'instagram',
-                'type' => 'image',
-                'url' => $postData['permalink'] ?? null,
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish image post to Instagram: ' . $e->getMessage());
+        // Instagram requires media for posts. Use publishImage or publishVideo.
+        if (isset($options["image_path"])) {
+            return $this->publishImage($accessToken, $targetId, $text, $options["image_path"], $options);
         }
+        if (isset($options["video_path"])) {
+            return $this->publishVideo($accessToken, $targetId, $text, $options["video_path"], $options["thumbnail_path"] ?? null, $options);
+        }
+        throw new PublishingException("Instagram requires an image or video to publish a post. Use publishImage or publishVideo methods.");
     }
 
     /**
-     * Publish a video post to Instagram.
+     * Publish an image post (single image or carousel).
      *
-     * @param string $content
-     * @param string $videoUrl
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $targetId Instagram Business Account ID.
+     * @param string $caption The caption for the image(s).
+     * @param string|array $imagePaths Path(s) to the image file(s) on local storage.
+     * @param array $options Additional options (e.g., user_tags).
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
      */
-    public function publishVideo(string $content, string $videoUrl, array $options = []): array
+    public function publishImage(string $accessToken, string $targetId, string $caption, $imagePaths, array $options = []): array
     {
+        $imagePaths = (array) $imagePaths;
+        $isCarousel = count($imagePaths) > 1;
+
         try {
-            $accessToken = $this->account->access_token;
-            $igAccountId = $this->getInstagramAccountId();
-
-            // Step 1: Create a container for the video
-            $response = $this->client->post("v18.0/{$igAccountId}/media", [
-                'form_params' => [
-                    'media_type' => 'VIDEO',
-                    'video_url' => $videoUrl,
-                    'caption' => $content,
-                    'access_token' => $accessToken,
-                ],
-            ]);
-
-            $data = json_decode($response->getBody()->getContents(), true);
-
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to create media container for Instagram video.');
+            $mediaContainerIds = [];
+            foreach ($imagePaths as $imagePath) {
+                // Step 1: Upload image(s) to Instagram container
+                $uploadUrl = $this->getImageUploadUrl($imagePath);
+                $containerId = $this->uploadMediaContainer($accessToken, $targetId, $uploadUrl, $isCarousel);
+                $mediaContainerIds[] = $containerId;
             }
 
-            $mediaContainerId = $data['id'];
-
-            // Step 2: Check the status of the container (videos need to be processed)
-            $statusChecked = false;
-            $maxAttempts = 10;
-            $attempts = 0;
-
-            while (!$statusChecked && $attempts < $maxAttempts) {
-                $statusResponse = $this->client->get("v18.0/{$mediaContainerId}", [
-                    'query' => [
-                        'fields' => 'status_code',
-                        'access_token' => $accessToken,
-                    ],
-                ]);
-
-                $statusData = json_decode($statusResponse->getBody()->getContents(), true);
-
-                if (isset($statusData['status_code']) && $statusData['status_code'] === 'FINISHED') {
-                    $statusChecked = true;
-                } elseif (isset($statusData['status_code']) && $statusData['status_code'] === 'ERROR') {
-                    throw new PublishingException('Error processing video for Instagram: ' . ($statusData['error_message'] ?? 'Unknown error'));
-                } else {
-                    // Wait before checking again
-                    sleep(2);
-                    $attempts++;
-                }
-            }
-
-            if (!$statusChecked) {
-                throw new PublishingException('Timeout waiting for Instagram video processing.');
+            if ($isCarousel) {
+                // Step 2a: Create carousel container
+                $carouselContainerId = $this->createCarouselContainer($accessToken, $targetId, $caption, $mediaContainerIds, $options);
+                $publishContainerId = $carouselContainerId;
+            } else {
+                // Step 2b: Use single image container ID for publishing
+                $publishContainerId = $mediaContainerIds[0];
+                // Add caption to single image container if needed (alternative to adding during publish)
+                // Note: Caption is usually added during the final publish step for single images.
             }
 
             // Step 3: Publish the container
-            $publishResponse = $this->client->post("v18.0/{$igAccountId}/media_publish", [
-                'form_params' => [
-                    'creation_id' => $mediaContainerId,
-                    'access_token' => $accessToken,
-                ],
-            ]);
-
-            $publishData = json_decode($publishResponse->getBody()->getContents(), true);
-
-            if (!isset($publishData['id'])) {
-                throw new PublishingException('Failed to publish video to Instagram.');
-            }
-
-            $postId = $publishData['id'];
-
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $postId,
-                'content' => $content,
-                'media_urls' => [$videoUrl],
-                'post_type' => 'video',
-                'status' => 'published',
-                'published_at' => now(),
-            ]);
-
-            // Get post URL
-            $postData = $this->getPostDetails($postId, $accessToken);
-            $post->update([
-                'post_url' => $postData['permalink'] ?? null,
-            ]);
+            $publishResponse = $this->publishMediaContainer($accessToken, $targetId, $publishContainerId, $caption, !$isCarousel ? $options : []);
 
             return [
-                'id' => $postId,
-                'platform' => 'instagram',
-                'type' => 'video',
-                'url' => $postData['permalink'] ?? null,
+                "platform" => "instagram",
+                "platform_post_id" => $publishResponse["id"],
             ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish video post to Instagram: ' . $e->getMessage());
+        } catch (GuzzleException | \Exception $e) {
+            throw new PublishingException("Failed to publish image post to Instagram: " . $e->getMessage());
         }
     }
 
     /**
-     * Publish a link post to Instagram.
-     * Note: Instagram doesn't support link posts directly, so we'll throw an exception.
+     * Publish a video post.
      *
-     * @param string $content
+     * @param string $accessToken Facebook Page access token with Instagram permissions.
+     * @param string $targetId Instagram Business Account ID.
+     * @param string $caption The caption for the video.
+     * @param string $videoPath Path to the video file on local storage.
+     * @param string|null $thumbnailPath Optional path to the thumbnail file (ignored by IG API, uses video frame).
+     * @param array $options Additional options (e.g., user_tags).
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
+     */
+    public function publishVideo(string $accessToken, string $targetId, string $caption, string $videoPath, ?string $thumbnailPath = null, array $options = []): array
+    {
+        try {
+            // Step 1: Upload video to Instagram container
+            $uploadUrl = $this->getVideoUploadUrl($videoPath);
+            $containerId = $this->uploadMediaContainer($accessToken, $targetId, $uploadUrl, false, true);
+
+            // Step 2: Publish the container
+            // Caption and other options are added during publish for videos
+            $publishResponse = $this->publishMediaContainer($accessToken, $targetId, $containerId, $caption, $options);
+
+            return [
+                "platform" => "instagram",
+                "platform_post_id" => $publishResponse["id"],
+            ];
+        } catch (GuzzleException | \Exception $e) {
+            throw new PublishingException("Failed to publish video post to Instagram: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Publish a link post (Not supported by Instagram API).
+     *
+     * @param string $accessToken
+     * @param string $targetId
+     * @param string $text
      * @param string $url
      * @param array $options
      * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @throws PublishingException
      */
-    public function publishLink(string $content, string $url, array $options = []): array
+    public function publishLink(string $accessToken, string $targetId, string $text, string $url, array $options = []): array
     {
-        throw new PublishingException('Instagram does not support direct link posts. You can include the link in the caption of an image or video post.');
+        throw new PublishingException("Publishing link-only posts is not supported by Instagram.");
     }
 
     /**
-     * Schedule a post for future publishing.
-     * Note: Instagram Graph API doesn't support scheduling directly, so we'll store it locally and publish later.
+     * Delete a post (Not directly supported by Instagram Graph API for general posts).
      *
-     * @param string $content
-     * @param \DateTime $scheduledAt
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function schedulePost(string $content, \DateTime $scheduledAt, array $options = []): array
-    {
-        try {
-            $postType = $options['post_type'] ?? null;
-            
-            if (!in_array($postType, ['image', 'video'])) {
-                throw new PublishingException('Instagram only supports scheduling image or video posts.');
-            }
-            
-            if (!isset($options['media_urls']) || empty($options['media_urls'])) {
-                throw new PublishingException('Media URLs are required for scheduling Instagram posts.');
-            }
-            
-            $mediaUrls = is_array($options['media_urls']) ? $options['media_urls'] : [$options['media_urls']];
-            
-            // Create a scheduled post record
-            $post = $this->createSocialPost([
-                'content' => $content,
-                'media_urls' => $mediaUrls,
-                'post_type' => $postType,
-                'status' => 'scheduled',
-                'scheduled_at' => $scheduledAt,
-                'metadata' => [
-                    'options' => $options,
-                ],
-            ]);
-            
-            return [
-                'id' => $post->id,
-                'platform' => 'instagram',
-                'type' => $postType,
-                'scheduled_at' => $scheduledAt->format('Y-m-d H:i:s'),
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to schedule post on Instagram: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Delete a post from Instagram.
-     *
-     * @param string $postId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function deletePost(string $postId): bool
-    {
-        try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->delete("v18.0/{$postId}", [
-                'query' => [
-                    'access_token' => $accessToken,
-                ],
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || $data['success'] !== true) {
-                throw new PublishingException('Failed to delete post from Instagram.');
-            }
-            
-            // Update social post record
-            SocialPost::where('platform_post_id', $postId)
-                ->where('platform', 'instagram')
-                ->update(['status' => 'deleted']);
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to delete post from Instagram: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Get the Instagram account ID from the account metadata.
-     *
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    protected function getInstagramAccountId(): string
-    {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['id'])) {
-            return $metadata['id'];
-        }
-        
-        throw new PublishingException('Instagram account ID not found in account metadata.');
-    }
-
-    /**
-     * Get post details from Instagram.
-     *
-     * @param string $postId
      * @param string $accessToken
-     * @return array
+     * @param string $postId The ID of the media to delete.
+     * @return bool
+     * @throws PublishingException
      */
-    protected function getPostDetails(string $postId, string $accessToken): array
+    public function deletePost(string $accessToken, string $postId): bool
     {
+        // Instagram Graph API generally doesn't allow deleting arbitrary media via API.
+        // Some specific types like comments might be deletable.
+        // Consider removing this method or clarifying its limitations.
+        // For now, throw an exception.
+        throw new PublishingException("Deleting posts via the Instagram Graph API is generally not supported.");
+        // If deletion was possible, it would look something like:
+        /*
         try {
-            $response = $this->client->get("v18.0/{$postId}", [
-                'query' => [
-                    'fields' => 'id,permalink,caption',
-                    'access_token' => $accessToken,
-                ],
+            $response = $this->graphClient->delete($postId, [
+                "query" => ["access_token" => $accessToken],
             ]);
-            
-            return json_decode($response->getBody()->getContents(), true);
-        } catch (\Exception $e) {
-            return [];
+            $data = json_decode($response->getBody()->getContents(), true);
+            return isset($data["success"]) && $data["success"];
+        } catch (GuzzleException $e) {
+            throw new PublishingException("Failed to delete Instagram post: " . $e->getMessage());
         }
+        */
     }
 
-    /**
-     * Create a social post record.
-     *
-     * @param array $data
-     * @return \VendorName\SocialConnect\Models\SocialPost
-     */
-    protected function createSocialPost(array $data): SocialPost
+    // --- Helper Methods for Instagram Content Publishing Flow ---
+
+    protected function getImageUploadUrl(string $imagePath): string
     {
-        return SocialPost::create(array_merge([
-            'user_id' => $this->account->user_id,
-            'social_account_id' => $this->account->id,
-            'platform' => 'instagram',
-        ], $data));
+        // Placeholder: In a real scenario, you might need to get a one-time upload URL from IG API first.
+        // For simplicity here, we assume direct upload is possible or use a known endpoint.
+        // Actual implementation might involve resumable uploads for reliability.
+        if (!Storage::exists($imagePath)) {
+            throw new PublishingException("Image file not found at path: {$imagePath}");
+        }
+        return Storage::url($imagePath); // Needs to be a publicly accessible URL
+    }
+
+    protected function getVideoUploadUrl(string $videoPath): string
+    {
+        if (!Storage::exists($videoPath)) {
+            throw new PublishingException("Video file not found at path: {$videoPath}");
+        }
+        return Storage::url($videoPath); // Needs to be a publicly accessible URL
+    }
+
+    protected function uploadMediaContainer(string $accessToken, string $targetId, string $mediaUrl, bool $isCarouselItem = false, bool $isVideo = false): string
+    {
+        $params = [
+            "access_token" => $accessToken,
+        ];
+        if ($isVideo) {
+            $params["media_type"] = "VIDEO";
+            $params["video_url"] = $mediaUrl;
+        } else {
+            $params["image_url"] = $mediaUrl;
+            if ($isCarouselItem) {
+                $params["is_carousel_item"] = "true";
+            }
+        }
+
+        $response = $this->graphClient->post("{$targetId}/media", [
+            "form_params" => $params,
+        ]);
+        $data = json_decode($response->getBody()->getContents(), true);
+
+        if (!isset($data["id"])) {
+            throw new PublishingException("Failed to create Instagram media container.");
+        }
+
+        // Check upload status asynchronously
+        return $this->checkMediaUploadStatus($accessToken, $data["id"]);
+    }
+
+    protected function createCarouselContainer(string $accessToken, string $targetId, string $caption, array $childrenContainerIds, array $options): string
+    {
+        $params = [
+            "caption" => $caption,
+            "media_type" => "CAROUSEL",
+            "children" => implode(",", $childrenContainerIds),
+            "access_token" => $accessToken,
+        ];
+        // Add user tags if provided in options
+        // $params['user_tags'] = json_encode($options['user_tags']);
+
+        $response = $this->graphClient->post("{$targetId}/media", [
+            "form_params" => $params,
+        ]);
+        $data = json_decode($response->getBody()->getContents(), true);
+
+        if (!isset($data["id"])) {
+            throw new PublishingException("Failed to create Instagram carousel container.");
+        }
+        return $data["id"];
+    }
+
+    protected function publishMediaContainer(string $accessToken, string $targetId, string $containerId, string $caption, array $options): array
+    {
+        $params = [
+            "creation_id" => $containerId,
+            "access_token" => $accessToken,
+        ];
+
+        // For single media items, caption/location/tags are added here
+        // For carousels, they are added during carousel container creation
+        // However, let's add caption here for single items for consistency
+        // Check if it's a video or single image container (not carousel)
+        // This logic might need refinement based on exact API behavior
+        $containerInfo = $this->getMediaContainerStatus($accessToken, $containerId);
+        if ($containerInfo["media_type"] !== "CAROUSEL") {
+             $params["caption"] = $caption;
+             // Add user tags, location etc. from $options if needed
+             // $params['user_tags'] = json_encode($options['user_tags']);
+             // $params['location_id'] = $options['location_id'];
+        }
+
+
+        $response = $this->graphClient->post("{$targetId}/media_publish", [
+            "form_params" => $params,
+        ]);
+        $data = json_decode($response->getBody()->getContents(), true);
+
+        if (!isset($data["id"])) {
+            throw new PublishingException("Failed to publish Instagram media container.");
+        }
+        return $data; // Contains the ID of the published media post
+    }
+
+    protected function checkMediaUploadStatus(string $accessToken, string $containerId, int $maxAttempts = 10, int $delay = 6): string
+    {
+        $attempts = 0;
+        while ($attempts < $maxAttempts) {
+            try {
+                $statusData = $this->getMediaContainerStatus($accessToken, $containerId);
+                $statusCode = $statusData["status_code"] ?? null;
+
+                if ($statusCode === "FINISHED") {
+                    return $containerId;
+                }
+                if ($statusCode === "ERROR" || $statusCode === "EXPIRED") {
+                    throw new PublishingException("Instagram media upload failed with status: " . ($statusData["status"] ?? "Unknown Error"));
+                }
+                // If IN_PROGRESS, wait and retry
+            } catch (GuzzleException $e) {
+                // Handle exceptions during status check
+                throw new PublishingException("Error checking Instagram media upload status: " . $e->getMessage());
+            }
+
+            $attempts++;
+            sleep($delay);
+        }
+        throw new PublishingException("Instagram media upload timed out after {$maxAttempts} attempts.");
+    }
+
+    protected function getMediaContainerStatus(string $accessToken, string $containerId): array
+    {
+         $response = $this->graphClient->get($containerId, [
+            "query" => [
+                "fields" => "status_code,status,media_type",
+                "access_token" => $accessToken,
+            ],
+        ]);
+        return json_decode($response->getBody()->getContents(), true);
     }
 }

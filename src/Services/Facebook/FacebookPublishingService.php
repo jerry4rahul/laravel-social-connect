@@ -3,10 +3,11 @@
 namespace VendorName\SocialConnect\Services\Facebook;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Storage;
 use VendorName\SocialConnect\Contracts\PublishableInterface;
 use VendorName\SocialConnect\Exceptions\PublishingException;
-use VendorName\SocialConnect\Models\SocialAccount;
-use VendorName\SocialConnect\Models\SocialPost;
 
 class FacebookPublishingService implements PublishableInterface
 {
@@ -18,644 +19,316 @@ class FacebookPublishingService implements PublishableInterface
     protected $client;
 
     /**
-     * The social account instance.
+     * Facebook Graph API version.
      *
-     * @var \VendorName\SocialConnect\Models\SocialAccount
+     * @var string
      */
-    protected $account;
+    protected $graphVersion;
 
     /**
      * Create a new FacebookPublishingService instance.
-     *
-     * @param \VendorName\SocialConnect\Models\SocialAccount $account
      */
-    public function __construct(SocialAccount $account)
+    public function __construct()
     {
-        $this->account = $account;
+        $config = Config::get("social-connect.platforms.facebook");
+        $this->graphVersion = $config["graph_version"] ?? "v18.0";
+
         $this->client = new Client([
-            'base_uri' => 'https://graph.facebook.com/v18.0/',
-            'timeout' => 30,
+            "base_uri" => "https://graph.facebook.com/{$this->graphVersion}/",
+            "timeout" => 60, // Increased timeout for potential uploads
         ]);
     }
 
     /**
-     * Publish a text post to Facebook.
+     * Publish a text post.
      *
-     * @param string $content
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @param string $accessToken The access token for the page/user.
+     * @param string $targetId The ID of the Facebook Page or User to post to.
+     * @param string $text The text content of the post.
+     * @param array $options Additional options (e.g., link, scheduled_publish_time).
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
      */
-    public function publishText(string $content, array $options = []): array
+    public function publishText(string $accessToken, string $targetId, string $text, array $options = []): array
     {
-        try {
-            $pageId = $options['page_id'] ?? $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
+        $payload = [
+            "message" => $text,
+            "access_token" => $accessToken,
+        ];
 
-            $response = $this->client->post("{$pageId}/feed", [
-                'form_params' => [
-                    'message' => $content,
-                    'access_token' => $accessToken,
-                ],
+        if (isset($options["link"])) {
+            $payload["link"] = $options["link"];
+        }
+
+        if (isset($options["scheduled_publish_time"])) {
+            $payload["published"] = false;
+            $payload["scheduled_publish_time"] = $options["scheduled_publish_time"]; // Unix timestamp or ISO 8601
+        }
+
+        try {
+            $response = $this->client->post("{$targetId}/feed", [
+                "form_params" => $payload,
             ]);
 
             $data = json_decode($response->getBody()->getContents(), true);
 
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to publish text post to Facebook.');
+            if (!isset($data["id"])) {
+                throw new PublishingException("Failed to publish text post to Facebook. No post ID returned.");
             }
 
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'post_type' => 'text',
-                'status' => 'published',
-                'published_at' => now(),
-            ]);
-
-            // Get post URL
-            $postData = $this->getPostDetails($data['id'], $accessToken);
-            $post->update([
-                'post_url' => $postData['permalink_url'] ?? null,
-            ]);
-
             return [
-                'id' => $data['id'],
-                'platform' => 'facebook',
-                'type' => 'text',
-                'url' => $postData['permalink_url'] ?? null,
+                "platform" => "facebook",
+                "platform_post_id" => $data["id"],
             ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish text post to Facebook: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new PublishingException("Failed to publish text post to Facebook: " . $e->getMessage());
         }
     }
 
     /**
-     * Publish an image post to Facebook.
+     * Publish an image post.
      *
-     * @param string $content
-     * @param string|array $mediaUrls
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @param string $accessToken The access token for the page/user.
+     * @param string $targetId The ID of the Facebook Page or User to post to.
+     * @param string $caption The caption for the image.
+     * @param string|array $imagePaths Path(s) to the image file(s) on local storage.
+     * @param array $options Additional options (e.g., scheduled_publish_time).
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
      */
-    public function publishImage(string $content, $mediaUrls, array $options = []): array
+    public function publishImage(string $accessToken, string $targetId, string $caption, $imagePaths, array $options = []): array
     {
+        $imagePaths = (array) $imagePaths;
+        $isMultiImage = count($imagePaths) > 1;
+
         try {
-            $pageId = $options['page_id'] ?? $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-            $mediaUrls = is_array($mediaUrls) ? $mediaUrls : [$mediaUrls];
-
-            // For a single image
-            if (count($mediaUrls) === 1) {
-                $response = $this->client->post("{$pageId}/photos", [
-                    'form_params' => [
-                        'message' => $content,
-                        'url' => $mediaUrls[0],
-                        'access_token' => $accessToken,
-                    ],
-                ]);
-
-                $data = json_decode($response->getBody()->getContents(), true);
-
-                if (!isset($data['id']) && !isset($data['post_id'])) {
-                    throw new PublishingException('Failed to publish image post to Facebook.');
-                }
-
-                $postId = $data['post_id'] ?? $data['id'];
-            } else {
-                // For multiple images, we need to upload each one and then create a post with them
+            if ($isMultiImage) {
+                // Multi-image post (requires uploading photos first and then publishing feed with attached_media)
                 $attachedMedia = [];
-
-                foreach ($mediaUrls as $mediaUrl) {
-                    $uploadResponse = $this->client->post("{$pageId}/photos", [
-                        'form_params' => [
-                            'url' => $mediaUrl,
-                            'published' => 'false',
-                            'access_token' => $accessToken,
-                        ],
-                    ]);
-
-                    $uploadData = json_decode($uploadResponse->getBody()->getContents(), true);
-
-                    if (!isset($uploadData['id'])) {
-                        throw new PublishingException('Failed to upload image to Facebook.');
-                    }
-
-                    $attachedMedia[] = [
-                        'media_fbid' => $uploadData['id'],
-                    ];
+                foreach ($imagePaths as $imagePath) {
+                    $uploadResponse = $this->uploadPhoto($accessToken, $targetId, $imagePath, false); // Upload unpublished
+                    $attachedMedia[] = ["media_fbid" => $uploadResponse["id"]];
                 }
 
-                // Create a post with all uploaded images
-                $response = $this->client->post("{$pageId}/feed", [
-                    'form_params' => [
-                        'message' => $content,
-                        'attached_media' => json_encode($attachedMedia),
-                        'access_token' => $accessToken,
-                    ],
-                ]);
+                $payload = [
+                    "message" => $caption,
+                    "attached_media" => json_encode($attachedMedia),
+                    "access_token" => $accessToken,
+                ];
 
-                $data = json_decode($response->getBody()->getContents(), true);
-
-                if (!isset($data['id'])) {
-                    throw new PublishingException('Failed to publish multi-image post to Facebook.');
+                if (isset($options["scheduled_publish_time"])) {
+                    $payload["published"] = false;
+                    $payload["scheduled_publish_time"] = $options["scheduled_publish_time"];
                 }
 
-                $postId = $data['id'];
-            }
-
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $postId,
-                'content' => $content,
-                'media_urls' => $mediaUrls,
-                'post_type' => 'image',
-                'status' => 'published',
-                'published_at' => now(),
-            ]);
-
-            // Get post URL
-            $postData = $this->getPostDetails($postId, $accessToken);
-            $post->update([
-                'post_url' => $postData['permalink_url'] ?? null,
-            ]);
-
-            return [
-                'id' => $postId,
-                'platform' => 'facebook',
-                'type' => 'image',
-                'url' => $postData['permalink_url'] ?? null,
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish image post to Facebook: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Publish a video post to Facebook.
-     *
-     * @param string $content
-     * @param string $videoUrl
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function publishVideo(string $content, string $videoUrl, array $options = []): array
-    {
-        try {
-            $pageId = $options['page_id'] ?? $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-            $title = $options['title'] ?? '';
-            $description = $options['description'] ?? $content;
-
-            $response = $this->client->post("{$pageId}/videos", [
-                'form_params' => [
-                    'description' => $description,
-                    'title' => $title,
-                    'file_url' => $videoUrl,
-                    'access_token' => $accessToken,
-                ],
-            ]);
-
-            $data = json_decode($response->getBody()->getContents(), true);
-
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to publish video post to Facebook.');
-            }
-
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'media_urls' => [$videoUrl],
-                'post_type' => 'video',
-                'status' => 'published',
-                'published_at' => now(),
-                'metadata' => [
-                    'title' => $title,
-                    'description' => $description,
-                ],
-            ]);
-
-            // Get post URL (may need to wait for video processing)
-            $postData = $this->getPostDetails($data['id'], $accessToken);
-            $post->update([
-                'post_url' => $postData['permalink_url'] ?? null,
-            ]);
-
-            return [
-                'id' => $data['id'],
-                'platform' => 'facebook',
-                'type' => 'video',
-                'url' => $postData['permalink_url'] ?? null,
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish video post to Facebook: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Publish a link post to Facebook.
-     *
-     * @param string $content
-     * @param string $url
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function publishLink(string $content, string $url, array $options = []): array
-    {
-        try {
-            $pageId = $options['page_id'] ?? $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-
-            $response = $this->client->post("{$pageId}/feed", [
-                'form_params' => [
-                    'message' => $content,
-                    'link' => $url,
-                    'access_token' => $accessToken,
-                ],
-            ]);
-
-            $data = json_decode($response->getBody()->getContents(), true);
-
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to publish link post to Facebook.');
-            }
-
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'post_type' => 'link',
-                'status' => 'published',
-                'published_at' => now(),
-                'metadata' => [
-                    'link' => $url,
-                ],
-            ]);
-
-            // Get post URL
-            $postData = $this->getPostDetails($data['id'], $accessToken);
-            $post->update([
-                'post_url' => $postData['permalink_url'] ?? null,
-            ]);
-
-            return [
-                'id' => $data['id'],
-                'platform' => 'facebook',
-                'type' => 'link',
-                'url' => $postData['permalink_url'] ?? null,
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish link post to Facebook: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Schedule a post for future publishing.
-     *
-     * @param string $content
-     * @param \DateTime $scheduledAt
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function schedulePost(string $content, \DateTime $scheduledAt, array $options = []): array
-    {
-        try {
-            $pageId = $options['page_id'] ?? $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-            $postType = $options['post_type'] ?? 'text';
-            
-            $params = [
-                'message' => $content,
-                'published' => 'false',
-                'scheduled_publish_time' => $scheduledAt->getTimestamp(),
-                'access_token' => $accessToken,
-            ];
-            
-            // Add media if provided
-            if (isset($options['media_urls'])) {
-                if ($postType === 'image') {
-                    // For scheduling images, we need a different approach
-                    return $this->scheduleImagePost($content, $options['media_urls'], $scheduledAt, $options);
-                } elseif ($postType === 'video') {
-                    // For scheduling videos
-                    return $this->scheduleVideoPost($content, $options['media_urls'][0], $scheduledAt, $options);
-                }
-            }
-            
-            // Add link if provided
-            if (isset($options['link'])) {
-                $params['link'] = $options['link'];
-            }
-            
-            $response = $this->client->post("{$pageId}/feed", [
-                'form_params' => $params,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to schedule post on Facebook.');
-            }
-            
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'post_type' => $postType,
-                'status' => 'scheduled',
-                'scheduled_at' => $scheduledAt,
-                'metadata' => [
-                    'link' => $options['link'] ?? null,
-                ],
-            ]);
-            
-            return [
-                'id' => $data['id'],
-                'platform' => 'facebook',
-                'type' => $postType,
-                'scheduled_at' => $scheduledAt->format('Y-m-d H:i:s'),
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to schedule post on Facebook: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Schedule an image post for future publishing.
-     *
-     * @param string $content
-     * @param array|string $mediaUrls
-     * @param \DateTime $scheduledAt
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    protected function scheduleImagePost(string $content, $mediaUrls, \DateTime $scheduledAt, array $options = []): array
-    {
-        try {
-            $pageId = $options['page_id'] ?? $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-            $mediaUrls = is_array($mediaUrls) ? $mediaUrls : [$mediaUrls];
-            
-            // For a single image
-            if (count($mediaUrls) === 1) {
-                $response = $this->client->post("{$pageId}/photos", [
-                    'form_params' => [
-                        'message' => $content,
-                        'url' => $mediaUrls[0],
-                        'published' => 'false',
-                        'scheduled_publish_time' => $scheduledAt->getTimestamp(),
-                        'access_token' => $accessToken,
-                    ],
-                ]);
-                
-                $data = json_decode($response->getBody()->getContents(), true);
-                
-                if (!isset($data['id'])) {
-                    throw new PublishingException('Failed to schedule image post on Facebook.');
-                }
-                
-                $postId = $data['id'];
+                $endpoint = "{$targetId}/feed";
             } else {
-                // For multiple images, we need to upload each one and then create a scheduled post with them
-                $attachedMedia = [];
-                
-                foreach ($mediaUrls as $mediaUrl) {
-                    $uploadResponse = $this->client->post("{$pageId}/photos", [
-                        'form_params' => [
-                            'url' => $mediaUrl,
-                            'published' => 'false',
-                            'access_token' => $accessToken,
-                        ],
-                    ]);
-                    
-                    $uploadData = json_decode($uploadResponse->getBody()->getContents(), true);
-                    
-                    if (!isset($uploadData['id'])) {
-                        throw new PublishingException('Failed to upload image to Facebook for scheduling.');
-                    }
-                    
-                    $attachedMedia[] = [
-                        'media_fbid' => $uploadData['id'],
-                    ];
-                }
-                
-                // Create a scheduled post with all uploaded images
-                $response = $this->client->post("{$pageId}/feed", [
-                    'form_params' => [
-                        'message' => $content,
-                        'attached_media' => json_encode($attachedMedia),
-                        'published' => 'false',
-                        'scheduled_publish_time' => $scheduledAt->getTimestamp(),
-                        'access_token' => $accessToken,
+                // Single image post
+                $imagePath = $imagePaths[0];
+                $payload = [
+                    [
+                        "name" => "message",
+                        "contents" => $caption,
                     ],
-                ]);
-                
-                $data = json_decode($response->getBody()->getContents(), true);
-                
-                if (!isset($data['id'])) {
-                    throw new PublishingException('Failed to schedule multi-image post on Facebook.');
+                    [
+                        "name" => "source",
+                        "contents" => fopen(Storage::path($imagePath), "r"),
+                        "filename" => basename($imagePath),
+                    ],
+                    [
+                        "name" => "access_token",
+                        "contents" => $accessToken,
+                    ],
+                ];
+
+                if (isset($options["scheduled_publish_time"])) {
+                    $payload[] = ["name" => "published", "contents" => "false"];
+                    $payload[] = ["name" => "scheduled_publish_time", "contents" => $options["scheduled_publish_time"]];
                 }
-                
-                $postId = $data['id'];
+                $endpoint = "{$targetId}/photos";
             }
-            
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $postId,
-                'content' => $content,
-                'media_urls' => $mediaUrls,
-                'post_type' => 'image',
-                'status' => 'scheduled',
-                'scheduled_at' => $scheduledAt,
+
+            $response = $this->client->post($endpoint, [
+                ($isMultiImage ? "form_params" : "multipart") => $payload,
             ]);
-            
+
+            $data = json_decode($response->getBody()->getContents(), true);
+            $postId = $data["id"] ?? ($data["post_id"] ?? null); // post_id for single photo, id for feed post
+
+            if (!$postId) {
+                throw new PublishingException("Failed to publish image post to Facebook. No post ID returned.");
+            }
+
             return [
-                'id' => $postId,
-                'platform' => 'facebook',
-                'type' => 'image',
-                'scheduled_at' => $scheduledAt->format('Y-m-d H:i:s'),
+                "platform" => "facebook",
+                "platform_post_id" => $postId,
             ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to schedule image post on Facebook: ' . $e->getMessage());
+        } catch (GuzzleException | \Exception $e) {
+            throw new PublishingException("Failed to publish image post to Facebook: " . $e->getMessage());
         }
     }
 
     /**
-     * Schedule a video post for future publishing.
+     * Publish a video post.
      *
-     * @param string $content
-     * @param string $videoUrl
-     * @param \DateTime $scheduledAt
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @param string $accessToken The access token for the page/user.
+     * @param string $targetId The ID of the Facebook Page or User to post to.
+     * @param string $description The description for the video.
+     * @param string $videoPath Path to the video file on local storage.
+     * @param string|null $thumbnailPath Optional path to the thumbnail file.
+     * @param array $options Additional options (e.g., title, scheduled_publish_time).
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
      */
-    protected function scheduleVideoPost(string $content, string $videoUrl, \DateTime $scheduledAt, array $options = []): array
+    public function publishVideo(string $accessToken, string $targetId, string $description, string $videoPath, ?string $thumbnailPath = null, array $options = []): array
     {
+        // Note: Video uploads can be complex (resumable uploads recommended for large files)
+        // This is a simplified example using single request upload.
         try {
-            $pageId = $options['page_id'] ?? $this->getDefaultPageId();
-            $accessToken = $this->getPageAccessToken($pageId);
-            $title = $options['title'] ?? '';
-            $description = $options['description'] ?? $content;
-            
-            $response = $this->client->post("{$pageId}/videos", [
-                'form_params' => [
-                    'description' => $description,
-                    'title' => $title,
-                    'file_url' => $videoUrl,
-                    'published' => 'false',
-                    'scheduled_publish_time' => $scheduledAt->getTimestamp(),
-                    'access_token' => $accessToken,
+            $payload = [
+                [
+                    "name" => "description",
+                    "contents" => $description,
                 ],
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to schedule video post on Facebook.');
-            }
-            
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'media_urls' => [$videoUrl],
-                'post_type' => 'video',
-                'status' => 'scheduled',
-                'scheduled_at' => $scheduledAt,
-                'metadata' => [
-                    'title' => $title,
-                    'description' => $description,
+                [
+                    "name" => "source",
+                    "contents" => fopen(Storage::path($videoPath), "r"),
+                    "filename" => basename($videoPath),
                 ],
-            ]);
-            
-            return [
-                'id' => $data['id'],
-                'platform' => 'facebook',
-                'type' => 'video',
-                'scheduled_at' => $scheduledAt->format('Y-m-d H:i:s'),
+                [
+                    "name" => "access_token",
+                    "contents" => $accessToken,
+                ],
             ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to schedule video post on Facebook: ' . $e->getMessage());
+
+            if (isset($options["title"])) {
+                $payload[] = ["name" => "title", "contents" => $options["title"]];
+            }
+
+            if ($thumbnailPath) {
+                 $payload[] = [
+                    "name" => "thumb",
+                    "contents" => fopen(Storage::path($thumbnailPath), "r"),
+                    "filename" => basename($thumbnailPath),
+                ];
+            }
+
+            if (isset($options["scheduled_publish_time"])) {
+                $payload[] = ["name" => "published", "contents" => "false"];
+                $payload[] = ["name" => "scheduled_publish_time", "contents" => $options["scheduled_publish_time"]];
+            }
+
+            $response = $this->client->post("{$targetId}/videos", [
+                "multipart" => $payload,
+            ]);
+
+            $data = json_decode($response->getBody()->getContents(), true);
+
+            if (!isset($data["id"])) {
+                throw new PublishingException("Failed to publish video post to Facebook. No post ID returned.");
+            }
+
+            // Note: Video processing takes time. The ID returned here is the video ID, not necessarily the final post ID immediately.
+            // The post might appear later after processing.
+            return [
+                "platform" => "facebook",
+                "platform_post_id" => $data["id"], // This is the video ID
+                "status" => "processing", // Indicate video needs processing
+            ];
+        } catch (GuzzleException | \Exception $e) {
+            throw new PublishingException("Failed to publish video post to Facebook: " . $e->getMessage());
         }
     }
 
     /**
-     * Delete a post from Facebook.
+     * Publish a link post (handled by publishText with link option).
      *
-     * @param string $postId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @param string $accessToken The access token for the page/user.
+     * @param string $targetId The ID of the Facebook Page or User to post to.
+     * @param string $text The text content accompanying the link.
+     * @param string $url The URL to share.
+     * @param array $options Additional options (e.g., scheduled_publish_time).
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
      */
-    public function deletePost(string $postId): bool
+    public function publishLink(string $accessToken, string $targetId, string $text, string $url, array $options = []): array
+    {
+        $options["link"] = $url;
+        return $this->publishText($accessToken, $targetId, $text, $options);
+    }
+
+    /**
+     * Delete a post.
+     *
+     * @param string $accessToken The access token for the page/user.
+     * @param string $postId The ID of the post to delete.
+     * @return bool Returns true on success.
+     * @throws PublishingException
+     */
+    public function deletePost(string $accessToken, string $postId): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->delete("{$postId}", [
-                'query' => [
-                    'access_token' => $accessToken,
+            $response = $this->client->delete($postId, [
+                "query" => [
+                    "access_token" => $accessToken,
                 ],
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['success']) || $data['success'] !== true) {
-                throw new PublishingException('Failed to delete post from Facebook.');
+
+            if (!isset($data["success"]) || !$data["success"]) {
+                // Check for specific error messages if needed
+                throw new PublishingException("Failed to delete post from Facebook.");
             }
-            
-            // Update social post record
-            SocialPost::where('platform_post_id', $postId)
-                ->where('platform', 'facebook')
-                ->update(['status' => 'deleted']);
-            
+
             return true;
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to delete post from Facebook: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            // Handle cases like post already deleted or insufficient permissions
+            throw new PublishingException("Failed to delete post from Facebook: " . $e->getMessage());
         }
     }
 
     /**
-     * Get the default page ID from the account metadata.
+     * Helper function to upload a photo (used for multi-image posts).
      *
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    protected function getDefaultPageId(): string
-    {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['pages']) && !empty($metadata['pages'])) {
-            return $metadata['pages'][0]['id'];
-        }
-        
-        throw new PublishingException('No Facebook page found for this account.');
-    }
-
-    /**
-     * Get the page access token for a specific page.
-     *
-     * @param string $pageId
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    protected function getPageAccessToken(string $pageId): string
-    {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['pages'])) {
-            foreach ($metadata['pages'] as $page) {
-                if ($page['id'] === $pageId) {
-                    return $page['access_token'];
-                }
-            }
-        }
-        
-        throw new PublishingException('Page access token not found for page ID: ' . $pageId);
-    }
-
-    /**
-     * Get post details from Facebook.
-     *
-     * @param string $postId
      * @param string $accessToken
+     * @param string $targetId
+     * @param string $imagePath
+     * @param bool $published
      * @return array
+     * @throws PublishingException
      */
-    protected function getPostDetails(string $postId, string $accessToken): array
+    protected function uploadPhoto(string $accessToken, string $targetId, string $imagePath, bool $published = true): array
     {
         try {
-            $response = $this->client->get("{$postId}", [
-                'query' => [
-                    'fields' => 'permalink_url',
-                    'access_token' => $accessToken,
+            $payload = [
+                [
+                    "name" => "source",
+                    "contents" => fopen(Storage::path($imagePath), "r"),
+                    "filename" => basename($imagePath),
                 ],
-            ]);
-            
-            return json_decode($response->getBody()->getContents(), true);
-        } catch (\Exception $e) {
-            return [];
-        }
-    }
+                [
+                    "name" => "access_token",
+                    "contents" => $accessToken,
+                ],
+                [
+                    "name" => "published",
+                    "contents" => $published ? "true" : "false",
+                ],
+            ];
 
-    /**
-     * Create a social post record.
-     *
-     * @param array $data
-     * @return \VendorName\SocialConnect\Models\SocialPost
-     */
-    protected function createSocialPost(array $data): SocialPost
-    {
-        return SocialPost::create(array_merge([
-            'user_id' => $this->account->user_id,
-            'social_account_id' => $this->account->id,
-            'platform' => 'facebook',
-        ], $data));
+            $response = $this->client->post("{$targetId}/photos", [
+                "multipart" => $payload,
+            ]);
+
+            $data = json_decode($response->getBody()->getContents(), true);
+
+            if (!isset($data["id"])) {
+                throw new PublishingException("Failed to upload photo to Facebook.");
+            }
+            return $data;
+        } catch (GuzzleException | \Exception $e) {
+            throw new PublishingException("Failed to upload photo to Facebook: " . $e->getMessage());
+        }
     }
 }

@@ -4,228 +4,187 @@ namespace VendorName\SocialConnect\Services\YouTube;
 
 use Google_Client;
 use Google_Service_YouTube;
+use Google_Service_Oauth2;
+use Illuminate\Support\Facades\Config;
 use VendorName\SocialConnect\Contracts\SocialPlatformInterface;
 use VendorName\SocialConnect\Exceptions\AuthenticationException;
 
 class YouTubeService implements SocialPlatformInterface
 {
     /**
-     * The Google client instance.
+     * Google API Client.
      *
      * @var \Google_Client
      */
-    protected $client;
+    protected $googleClient;
 
     /**
-     * The client ID.
+     * YouTube Client ID.
      *
      * @var string
      */
     protected $clientId;
 
     /**
-     * The client secret.
+     * YouTube Client Secret.
      *
      * @var string
      */
     protected $clientSecret;
 
     /**
-     * The redirect URL.
+     * YouTube Redirect URI.
      *
      * @var string
      */
-    protected $redirectUrl;
+    protected $redirectUri;
 
     /**
      * Create a new YouTubeService instance.
-     *
-     * @param string $clientId
-     * @param string $clientSecret
-     * @param string|null $redirectUrl
      */
-    public function __construct(string $clientId, string $clientSecret, string $redirectUrl = null)
+    public function __construct()
     {
-        $this->clientId = $clientId;
-        $this->clientSecret = $clientSecret;
-        $this->redirectUrl = $redirectUrl;
-        
-        $this->client = new Google_Client();
-        $this->client->setClientId($this->clientId);
-        $this->client->setClientSecret($this->clientSecret);
-        $this->client->setRedirectUri($this->redirectUrl);
-        $this->client->setAccessType('offline');
-        $this->client->setPrompt('consent');
+        $config = Config::get("social-connect.platforms.youtube");
+
+        if (!isset($config["client_id"], $config["client_secret"], $config["redirect_uri"])) {
+            throw new AuthenticationException("YouTube client ID, client secret, or redirect URI is not configured.");
+        }
+
+        $this->clientId = $config["client_id"];
+        $this->clientSecret = $config["client_secret"];
+        $this->redirectUri = $config["redirect_uri"];
+
+        $this->googleClient = new Google_Client();
+        $this->googleClient->setClientId($this->clientId);
+        $this->googleClient->setClientSecret($this->clientSecret);
+        $this->googleClient->setRedirectUri($this->redirectUri);
+        $this->googleClient->setAccessType("offline"); // Request refresh token
+        $this->googleClient->setPrompt("consent"); // Force consent screen for refresh token
     }
 
     /**
-     * Get the authorization URL for YouTube.
+     * Get the authentication redirect URL.
      *
-     * @param array $scopes
-     * @param string $redirectUrl
+     * @param array $params Optional parameters (e.g., state, scope).
      * @return string
      */
-    public function getAuthorizationUrl(array $scopes = [], string $redirectUrl = null): string
+    public function getRedirectUrl(array $params = []): string
     {
-        $scopes = count($scopes) > 0 ? $scopes : $this->getDefaultScopes();
-        $redirectUrl = $redirectUrl ?: $this->redirectUrl;
-        
-        $this->client->setRedirectUri($redirectUrl);
-        $this->client->setScopes($scopes);
-        
-        return $this->client->createAuthUrl();
+        // Define default scopes required by the package
+        $defaultScopes = [
+            Google_Service_YouTube::YOUTUBE_FORCE_SSL, // Manage YouTube account
+            Google_Service_YouTube::YOUTUBE_UPLOAD, // Upload videos
+            Google_Service_YouTube::YOUTUBE_READONLY, // View account info
+            Google_Service_Oauth2::USERINFO_EMAIL, // Get user email
+            Google_Service_Oauth2::USERINFO_PROFILE, // Get user profile info
+            // Add scopes for analytics if needed (e.g., youtube.readonly, youtubereporting.readonly)
+            "https://www.googleapis.com/auth/youtube.readonly",
+            "https://www.googleapis.com/auth/youtubepartner",
+            "https://www.googleapis.com/auth/yt-analytics.readonly",
+            "https://www.googleapis.com/auth/yt-analytics-monetary.readonly",
+        ];
+
+        $scopes = $params["scope"] ?? Config::get("social-connect.platforms.youtube.scopes", $defaultScopes);
+        $state = $params["state"] ?? bin2hex(random_bytes(16));
+
+        $this->googleClient->setScopes($scopes);
+        $this->googleClient->setState($state);
+
+        return $this->googleClient->createAuthUrl();
     }
 
     /**
-     * Handle the callback from YouTube and retrieve the access token.
+     * Exchange authorization code for an access token.
      *
-     * @param string $code
-     * @param string $redirectUrl
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
+     * @param string $code Authorization code from callback.
+     * @param string|null $state State parameter (optional, for verification).
+     * @return array Returns an array containing token information and basic user profile.
+     * @throws AuthenticationException
      */
-    public function handleCallback(string $code, string $redirectUrl = null): array
+    public function exchangeCodeForToken(string $code, ?string $state = null): array
     {
-        $redirectUrl = $redirectUrl ?: $this->redirectUrl;
-        $this->client->setRedirectUri($redirectUrl);
-
         try {
-            $token = $this->client->fetchAccessTokenWithAuthCode($code);
+            // Exchange code for access token
+            $tokenData = $this->googleClient->fetchAccessTokenWithAuthCode($code);
 
-            if (!isset($token['access_token'])) {
-                throw new AuthenticationException('Failed to retrieve access token from YouTube.');
+            if (isset($tokenData["error"])) {
+                throw new AuthenticationException("Failed to retrieve access token from Google: " . $tokenData["error_description"]);
             }
 
-            // Get user profile
-            $this->client->setAccessToken($token);
-            $profile = $this->getUserProfile($token['access_token']);
+            if (!isset($tokenData["access_token"])) {
+                throw new AuthenticationException("Access token not found in Google response.");
+            }
+
+            // Set the access token for subsequent API calls
+            $this->googleClient->setAccessToken($tokenData);
+
+            // Get user profile info from Google OAuth2 service
+            $oauth2Service = new Google_Service_Oauth2($this->googleClient);
+            $userInfo = $oauth2Service->userinfo->get();
+
+            // Get YouTube channel info (requires YouTube scope)
+            $youtubeService = new Google_Service_YouTube($this->googleClient);
+            $channelsResponse = $youtubeService->channels->listChannels("snippet,contentDetails,statistics", ["mine" => true]);
+            $channel = $channelsResponse->getItems()[0] ?? null;
+
+            if (!$channel) {
+                throw new AuthenticationException("Could not retrieve YouTube channel information.");
+            }
+
+            $channelId = $channel->getId();
+            $channelSnippet = $channel->getSnippet();
 
             return [
-                'access_token' => $token['access_token'],
-                'refresh_token' => $token['refresh_token'] ?? null,
-                'expires_in' => $token['expires_in'] ?? 3600,
-                'token_type' => $token['token_type'] ?? 'Bearer',
-                'profile' => $profile,
+                "platform" => "youtube",
+                "access_token" => $tokenData["access_token"],
+                "refresh_token" => $tokenData["refresh_token"] ?? null,
+                "token_secret" => null, // OAuth 2.0 doesn't use token secrets
+                "expires_in" => $tokenData["expires_in"] ?? null,
+                "platform_user_id" => $channelId, // Use YouTube Channel ID as the primary ID
+                "name" => $channelSnippet->getTitle() ?? $userInfo->getName(),
+                "email" => $userInfo->getEmail(),
+                "avatar" => $channelSnippet->getThumbnails()->getDefault()->getUrl() ?? $userInfo->getPicture(),
+                "username" => $channelSnippet->getCustomUrl() ?? null, // YouTube custom URL if set
+                "raw_token_data" => $tokenData,
+                "raw_profile_data" => $userInfo->toSimpleObject(), // Google profile
+                "raw_channel_data" => $channel->toSimpleObject(), // YouTube channel data
             ];
         } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to authenticate with YouTube: ' . $e->getMessage());
+            throw new AuthenticationException("YouTube token exchange failed: " . $e->getMessage());
         }
     }
 
     /**
-     * Refresh the access token using the refresh token.
+     * Refresh an access token using a refresh token.
      *
      * @param string $refreshToken
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
+     * @return array Returns new token data.
+     * @throws AuthenticationException
      */
-    public function refreshAccessToken(string $refreshToken): array
+    public function refreshToken(string $refreshToken): array
     {
         try {
-            $this->client->refreshToken($refreshToken);
-            $token = $this->client->getAccessToken();
+            $this->googleClient->fetchAccessTokenWithRefreshToken($refreshToken);
+            $tokenData = $this->googleClient->getAccessToken();
 
-            if (!isset($token['access_token'])) {
-                throw new AuthenticationException('Failed to refresh access token from YouTube.');
+            if (isset($tokenData["error"])) {
+                throw new AuthenticationException("Failed to refresh access token from Google: " . $tokenData["error_description"]);
+            }
+
+            if (!isset($tokenData["access_token"])) {
+                throw new AuthenticationException("Refreshed access token not found in Google response.");
             }
 
             return [
-                'access_token' => $token['access_token'],
-                'refresh_token' => $token['refresh_token'] ?? $refreshToken,
-                'expires_in' => $token['expires_in'] ?? 3600,
-                'token_type' => $token['token_type'] ?? 'Bearer',
+                "platform" => "youtube",
+                "access_token" => $tokenData["access_token"],
+                "refresh_token" => $tokenData["refresh_token"] ?? $refreshToken, // Return new or old refresh token
+                "token_secret" => null,
+                "expires_in" => $tokenData["expires_in"] ?? null,
+                "raw_token_data" => $tokenData,
             ];
         } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to refresh token with YouTube: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Get the user profile from YouTube.
-     *
-     * @param string $accessToken
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\AuthenticationException
-     */
-    public function getUserProfile(string $accessToken): array
-    {
-        try {
-            $this->client->setAccessToken($accessToken);
-            $youtube = new Google_Service_YouTube($this->client);
-            
-            // Get channel information
-            $channelsResponse = $youtube->channels->listChannels('snippet,contentDetails,statistics', [
-                'mine' => true
-            ]);
-            
-            if (empty($channelsResponse->getItems())) {
-                throw new AuthenticationException('No YouTube channel found for this user.');
-            }
-            
-            $channel = $channelsResponse->getItems()[0];
-            $snippet = $channel->getSnippet();
-            $statistics = $channel->getStatistics();
-            
-            return [
-                'id' => $channel->getId(),
-                'name' => $snippet->getTitle(),
-                'description' => $snippet->getDescription(),
-                'customUrl' => $snippet->getCustomUrl(),
-                'publishedAt' => $snippet->getPublishedAt(),
-                'thumbnails' => [
-                    'default' => $snippet->getThumbnails()->getDefault()->getUrl(),
-                    'medium' => $snippet->getThumbnails()->getMedium()->getUrl(),
-                    'high' => $snippet->getThumbnails()->getHigh()->getUrl(),
-                ],
-                'statistics' => [
-                    'viewCount' => $statistics->getViewCount(),
-                    'subscriberCount' => $statistics->getSubscriberCount(),
-                    'videoCount' => $statistics->getVideoCount(),
-                ],
-            ];
-        } catch (\Exception $e) {
-            throw new AuthenticationException('Failed to get user profile from YouTube: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Get the platform name.
-     *
-     * @return string
-     */
-    public function getPlatformName(): string
-    {
-        return 'youtube';
-    }
-
-    /**
-     * Get the default scopes for YouTube.
-     *
-     * @return array
-     */
-    public function getDefaultScopes(): array
-    {
-        return [
-            'https://www.googleapis.com/auth/youtube',
-            'https://www.googleapis.com/auth/youtube.readonly',
-            'https://www.googleapis.com/auth/youtube.upload',
-            'https://www.googleapis.com/auth/youtube.force-ssl',
-        ];
-    }
-
-    /**
-     * Validate the access token.
-     *
-     * @param string $accessToken
-     * @return bool
-     */
-    public function validateAccessToken(string $accessToken): bool
-    {
-        try {
-            $this->client->setAccessToken($accessToken);
-            return !$this->client->isAccessTokenExpired();
-        } catch (\Exception $e) {
-            return false;
+            throw new AuthenticationException("YouTube token refresh failed: " . $e->getMessage());
         }
     }
 }

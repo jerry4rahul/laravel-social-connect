@@ -2,459 +2,218 @@
 
 namespace VendorName\SocialConnect\Services\YouTube;
 
-use GuzzleHttp\Client;
+use Google_Client;
+use Google_Service_YouTube;
+use Illuminate\Support\Facades\Config;
 use VendorName\SocialConnect\Contracts\MessagingInterface;
 use VendorName\SocialConnect\Exceptions\MessagingException;
-use VendorName\SocialConnect\Models\SocialAccount;
-use VendorName\SocialConnect\Models\SocialConversation;
-use VendorName\SocialConnect\Models\SocialMessage;
 
 class YouTubeMessagingService implements MessagingInterface
 {
     /**
-     * The HTTP client instance.
+     * Google API Client.
      *
-     * @var \GuzzleHttp\Client
+     * @var \Google_Client
      */
-    protected $client;
-
-    /**
-     * The social account instance.
-     *
-     * @var \VendorName\SocialConnect\Models\SocialAccount
-     */
-    protected $account;
+    protected $googleClient;
 
     /**
      * Create a new YouTubeMessagingService instance.
-     *
-     * @param \VendorName\SocialConnect\Models\SocialAccount $account
      */
-    public function __construct(SocialAccount $account)
+    public function __construct()
     {
-        $this->account = $account;
-        $this->client = new Client([
-            'base_uri' => 'https://www.googleapis.com/youtube/v3/',
-            'timeout' => 30,
-        ]);
+        // Basic client setup, token will be set per request
+        $this->googleClient = new Google_Client();
+        $config = Config::get("social-connect.platforms.youtube");
+        if (isset($config["client_id"], $config["client_secret"], $config["redirect_uri"])) {
+            $this->googleClient->setClientId($config["client_id"]);
+            $this->googleClient->setClientSecret($config["client_secret"]);
+            $this->googleClient->setRedirectUri($config["redirect_uri"]);
+        }
     }
 
     /**
-     * Get conversations for the account.
+     * Get Google Client configured with access token.
      *
+     * @param string $accessToken
+     * @return Google_Client
+     * @throws MessagingException
+     */
+    protected function getApiClient(string $accessToken): Google_Client
+    {
+        if (empty($accessToken)) {
+            throw new MessagingException("YouTube access token is required.");
+        }
+        $client = clone $this->googleClient;
+        $client->setAccessToken($accessToken);
+        $client->addScope(Google_Service_YouTube::YOUTUBE_FORCE_SSL); // Scope needed for live chat
+        return $client;
+    }
+
+    /**
+     * Get conversations (Not applicable to YouTube standard messaging).
+     *
+     * @param string $accessToken
+     * @param string $tokenSecret
+     * @param string $targetId Channel ID.
      * @param int $limit
      * @param string|null $cursor
      * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @throws MessagingException
      */
-    public function getConversations(int $limit = 20, ?string $cursor = null): array
+    public function getConversations(string $accessToken, string $tokenSecret, string $targetId, int $limit = 20, ?string $cursor = null): array
     {
+        // YouTube doesn't have a direct conversation/DM inbox API like other platforms.
+        // Messaging is primarily through Live Chat during broadcasts.
+        throw new MessagingException("Getting conversation lists is not supported by the YouTube API. Use getMessages for Live Chat retrieval.");
+    }
+
+    /**
+     * Get messages for a specific conversation (Live Chat Messages).
+     *
+     * @param string $accessToken User Access Token with youtube.force-ssl scope.
+     * @param string $tokenSecret Ignored.
+     * @param string $conversationId The Live Chat ID (usually obtained from a liveBroadcast resource).
+     * @param int $limit Maximum number of messages to return.
+     * @param string|null $cursor Page token for pagination (nextPageToken).
+     * @return array Returns array containing messages and next cursor info.
+     * @throws MessagingException
+     */
+    public function getMessages(string $accessToken, string $tokenSecret, string $conversationId, int $limit = 50, ?string $cursor = null): array
+    {
+        // This retrieves messages from a specific Live Chat
         try {
-            $accessToken = $this->account->access_token;
-            
+            $client = $this->getApiClient($accessToken);
+            $youtubeService = new Google_Service_YouTube($client);
+
             $params = [
-                'part' => 'snippet',
-                'maxResults' => $limit,
+                "liveChatId" => $conversationId,
+                "part" => "id,snippet,authorDetails",
+                "maxResults" => min($limit, 2000), // Max 2000 per page for live chat
+                // "profileImageSize" => 88, // Optional: specify avatar size
             ];
-            
             if ($cursor) {
-                $params['pageToken'] = $cursor;
+                $params["pageToken"] = $cursor;
             }
-            
-            // YouTube API doesn't have direct messaging like other platforms
-            // We'll use the liveChatMessages endpoint to get chat messages from live streams
-            $response = $this->client->get('liveChat/messages', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                ],
-                'query' => $params,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['items'])) {
-                throw new MessagingException('Failed to retrieve conversations from YouTube.');
-            }
-            
-            $conversations = [];
-            $nextCursor = $data['nextPageToken'] ?? null;
-            
-            // Group messages by author to create "conversations"
-            $groupedMessages = [];
-            
-            foreach ($data['items'] as $message) {
-                $authorId = $message['snippet']['authorChannelId'] ?? null;
-                if (!$authorId) {
-                    continue;
-                }
-                
-                if (!isset($groupedMessages[$authorId])) {
-                    $groupedMessages[$authorId] = [
-                        'authorId' => $authorId,
-                        'authorName' => $message['snippet']['authorDisplayName'] ?? null,
-                        'authorProfileImage' => $message['snippet']['authorProfileImageUrl'] ?? null,
-                        'lastMessage' => $message['snippet']['displayMessage'] ?? null,
-                        'lastMessageTime' => $message['snippet']['publishedAt'] ?? null,
-                        'liveChatId' => $message['snippet']['liveChatId'] ?? null,
-                    ];
-                } else if (strtotime($message['snippet']['publishedAt']) > strtotime($groupedMessages[$authorId]['lastMessageTime'])) {
-                    $groupedMessages[$authorId]['lastMessage'] = $message['snippet']['displayMessage'] ?? null;
-                    $groupedMessages[$authorId]['lastMessageTime'] = $message['snippet']['publishedAt'] ?? null;
-                }
-            }
-            
-            foreach ($groupedMessages as $authorId => $messageGroup) {
-                // Create a unique conversation ID
-                $conversationId = $messageGroup['liveChatId'] . '_' . $authorId;
-                
-                // Store in database
-                $socialConversation = SocialConversation::updateOrCreate(
-                    [
-                        'social_account_id' => $this->account->id,
-                        'platform_conversation_id' => $conversationId,
+
+            $response = $youtubeService->liveChatMessages->listLiveChatMessages($conversationId, "snippet,authorDetails", $params);
+
+            $messages = $response->getItems() ?? [];
+            $nextCursor = $response->getNextPageToken();
+            // pollingIntervalMillis suggests how often to poll for new messages
+            $pollingInterval = $response->getPollingIntervalMillis();
+
+            // Format the output
+            $formattedMessages = array_map(function ($msg) {
+                /** @var \Google_Service_YouTube_LiveChatMessage $msg */
+                $snippet = $msg->getSnippet();
+                $author = $msg->getAuthorDetails();
+                return [
+                    "platform_message_id" => $msg->getId(),
+                    "created_time" => $snippet->getPublishedAt() ? date("c", strtotime($snippet->getPublishedAt())) : null,
+                    "from" => [
+                        "id" => $author->getChannelId(),
+                        "name" => $author->getDisplayName(),
+                        "avatar" => $author->getProfileImageUrl(),
+                        "is_moderator" => $author->getIsChatModerator(),
+                        "is_owner" => $author->getIsChatOwner(),
+                        "is_sponsor" => $author->getIsChatSponsor(),
+                        "is_verified" => $author->getIsVerified(),
                     ],
-                    [
-                        'user_id' => $this->account->user_id,
-                        'platform' => 'youtube',
-                        'recipient_id' => $authorId,
-                        'recipient_name' => $messageGroup['authorName'],
-                        'recipient_avatar' => $messageGroup['authorProfileImage'],
-                        'last_message_at' => new \DateTime($messageGroup['lastMessageTime']),
-                        'is_read' => true, // YouTube doesn't have read/unread status
-                        'metadata' => [
-                            'live_chat_id' => $messageGroup['liveChatId'],
-                            'snippet' => $messageGroup['lastMessage'],
-                        ],
-                    ]
-                );
-                
-                $conversations[] = [
-                    'id' => $socialConversation->id,
-                    'platform_conversation_id' => $conversationId,
-                    'recipient_id' => $authorId,
-                    'recipient_name' => $messageGroup['authorName'],
-                    'recipient_avatar' => $messageGroup['authorProfileImage'],
-                    'last_message_at' => $messageGroup['lastMessageTime'],
-                    'is_read' => true,
-                    'snippet' => $messageGroup['lastMessage'],
-                    'live_chat_id' => $messageGroup['liveChatId'],
+                    "to" => [], // Not applicable for broadcast chat
+                    "message" => $snippet->getDisplayMessage(),
+                    "type" => $snippet->getType(), // e.g., textMessageEvent, superChatEvent
+                    // Include details based on type if needed (e.g., amount for superChatEvent)
+                    "raw_snippet" => $snippet->toSimpleObject(),
                 ];
-            }
-            
+            }, $messages);
+
             return [
-                'conversations' => $conversations,
-                'next_cursor' => $nextCursor,
+                "platform" => "youtube",
+                "conversation_id" => $conversationId, // Live Chat ID
+                "messages" => $formattedMessages,
+                "next_cursor" => $nextCursor,
+                "polling_interval_ms" => $pollingInterval,
+                "raw_response" => $response->toSimpleObject(),
             ];
         } catch (\Exception $e) {
-            throw new MessagingException('Failed to get conversations from YouTube: ' . $e->getMessage());
+            throw new MessagingException("Failed to get YouTube live chat messages: " . $e->getMessage());
         }
     }
-    
+
     /**
-     * Get messages for a specific conversation.
+     * Send a new message or reply (Post message to Live Chat).
      *
-     * @param string $conversationId
-     * @param int $limit
-     * @param string|null $cursor
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @param string $accessToken User Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $targetId Ignored (message is sent to the live chat).
+     * @param string $recipientId The Live Chat ID to post the message to.
+     * @param string $message The text message content.
+     * @param array $options Additional options.
+     * @return array Returns array with platform_message_id.
+     * @throws MessagingException
      */
-    public function getMessages(string $conversationId, int $limit = 20, ?string $cursor = null): array
+    public function sendMessage(string $accessToken, string $tokenSecret, string $targetId, string $recipientId, string $message, array $options = []): array
     {
+        // This posts a message to a specific Live Chat
         try {
-            $accessToken = $this->account->access_token;
-            
-            // Parse the conversation ID to get liveChatId and authorId
-            list($liveChatId, $authorId) = explode('_', $conversationId);
-            
-            $params = [
-                'part' => 'snippet',
-                'liveChatId' => $liveChatId,
-                'maxResults' => $limit,
-            ];
-            
-            if ($cursor) {
-                $params['pageToken'] = $cursor;
-            }
-            
-            $response = $this->client->get('liveChat/messages', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                ],
-                'query' => $params,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['items'])) {
-                throw new MessagingException('Failed to retrieve messages from YouTube.');
-            }
-            
-            // Get the conversation from database
-            $socialConversation = SocialConversation::where('platform_conversation_id', $conversationId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if (!$socialConversation) {
-                // Create the conversation if it doesn't exist
-                $socialConversation = SocialConversation::create([
-                    'user_id' => $this->account->user_id,
-                    'social_account_id' => $this->account->id,
-                    'platform' => 'youtube',
-                    'platform_conversation_id' => $conversationId,
-                    'recipient_id' => $authorId,
-                    'last_message_at' => now(),
-                    'metadata' => [
-                        'live_chat_id' => $liveChatId,
-                    ],
-                ]);
-            }
-            
-            $messages = [];
-            $nextCursor = $data['nextPageToken'] ?? null;
-            
-            // Filter messages by the specific author
-            $filteredMessages = array_filter($data['items'], function($message) use ($authorId) {
-                return ($message['snippet']['authorChannelId'] ?? null) === $authorId;
-            });
-            
-            foreach ($filteredMessages as $message) {
-                $messageId = $message['id'];
-                $messageText = $message['snippet']['displayMessage'] ?? '';
-                $senderId = $message['snippet']['authorChannelId'] ?? null;
-                $senderName = $message['snippet']['authorDisplayName'] ?? null;
-                $createdAt = $message['snippet']['publishedAt'] ?? null;
-                $isFromMe = false; // All messages are from the author in this case
-                
-                // Store in database
-                $socialMessage = SocialMessage::updateOrCreate(
-                    [
-                        'social_conversation_id' => $socialConversation->id,
-                        'platform_message_id' => $messageId,
-                    ],
-                    [
-                        'user_id' => $this->account->user_id,
-                        'social_account_id' => $this->account->id,
-                        'platform' => 'youtube',
-                        'message' => $messageText,
-                        'sender_id' => $senderId,
-                        'sender_name' => $senderName,
-                        'is_from_me' => $isFromMe,
-                        'is_read' => true,
-                        'metadata' => [
-                            'created_at' => $createdAt,
-                            'author_profile_image' => $message['snippet']['authorProfileImageUrl'] ?? null,
-                        ],
-                    ]
-                );
-                
-                $messages[] = [
-                    'id' => $socialMessage->id,
-                    'platform_message_id' => $messageId,
-                    'message' => $messageText,
-                    'sender_id' => $senderId,
-                    'sender_name' => $senderName,
-                    'sender_avatar' => $message['snippet']['authorProfileImageUrl'] ?? null,
-                    'is_from_me' => $isFromMe,
-                    'created_at' => $createdAt,
-                ];
-            }
-            
+            $client = $this->getApiClient($accessToken);
+            $youtubeService = new Google_Service_YouTube($client);
+
+            $liveChatMessage = new \Google_Service_YouTube_LiveChatMessage();
+            $snippet = new \Google_Service_YouTube_LiveChatMessageSnippet();
+            $snippet->setType("textMessageEvent");
+            $snippet->setLiveChatId($recipientId);
+
+            $textDetails = new \Google_Service_YouTube_LiveChatTextMessageDetails();
+            $textDetails->setMessageText($message);
+            $snippet->setTextMessageDetails($textDetails);
+
+            $liveChatMessage->setSnippet($snippet);
+
+            $response = $youtubeService->liveChatMessages->insert("snippet", $liveChatMessage);
+
             return [
-                'conversation_id' => $socialConversation->id,
-                'platform_conversation_id' => $conversationId,
-                'messages' => $messages,
-                'next_cursor' => $nextCursor,
+                "platform" => "youtube",
+                "platform_message_id" => $response->getId(),
+                "recipient_id" => $recipientId, // Live Chat ID
+                "raw_response" => $response->toSimpleObject(),
             ];
         } catch (\Exception $e) {
-            throw new MessagingException('Failed to get messages from YouTube: ' . $e->getMessage());
+            // Handle specific errors, e.g., chat disabled, user banned, rate limits
+            throw new MessagingException("Failed to send YouTube live chat message: " . $e->getMessage());
         }
     }
-    
+
     /**
-     * Send a new message to a recipient.
+     * Reply to an existing conversation (Not applicable to YouTube Live Chat).
      *
-     * @param string $recipientId
-     * @param string $message
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
-     */
-    public function sendMessage(string $recipientId, string $message, array $options = []): array
-    {
-        try {
-            $accessToken = $this->account->access_token;
-            
-            // YouTube doesn't support direct messaging between users
-            // We can only send messages to live chat
-            if (!isset($options['live_chat_id'])) {
-                throw new MessagingException('Live chat ID is required to send messages on YouTube.');
-            }
-            
-            $liveChatId = $options['live_chat_id'];
-            
-            $payload = [
-                'snippet' => [
-                    'liveChatId' => $liveChatId,
-                    'type' => 'textMessageEvent',
-                    'textMessageDetails' => [
-                        'messageText' => $message,
-                    ],
-                ],
-            ];
-            
-            $response = $this->client->post('liveChat/messages', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => $payload,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new MessagingException('Failed to send message to YouTube live chat.');
-            }
-            
-            $messageId = $data['id'];
-            $conversationId = $liveChatId . '_' . $recipientId;
-            
-            // Find or create conversation
-            $socialConversation = SocialConversation::where('platform_conversation_id', $conversationId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if (!$socialConversation) {
-                // Get recipient details if available
-                $recipientName = $options['recipient_name'] ?? null;
-                $recipientAvatar = $options['recipient_avatar'] ?? null;
-                
-                // Create new conversation
-                $socialConversation = SocialConversation::create([
-                    'user_id' => $this->account->user_id,
-                    'social_account_id' => $this->account->id,
-                    'platform' => 'youtube',
-                    'platform_conversation_id' => $conversationId,
-                    'recipient_id' => $recipientId,
-                    'recipient_name' => $recipientName,
-                    'recipient_avatar' => $recipientAvatar,
-                    'last_message_at' => now(),
-                    'is_read' => true,
-                    'metadata' => [
-                        'live_chat_id' => $liveChatId,
-                    ],
-                ]);
-            } else {
-                // Update existing conversation
-                $socialConversation->update([
-                    'last_message_at' => now(),
-                ]);
-            }
-            
-            // Store message
-            $socialMessage = SocialMessage::create([
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'social_conversation_id' => $socialConversation->id,
-                'platform' => 'youtube',
-                'platform_message_id' => $messageId,
-                'message' => $message,
-                'sender_id' => $this->getChannelId(),
-                'sender_name' => $this->account->name,
-                'is_from_me' => true,
-                'is_read' => true,
-            ]);
-            
-            return [
-                'success' => true,
-                'message_id' => $messageId,
-                'conversation_id' => $socialConversation->id,
-                'platform_conversation_id' => $conversationId,
-                'recipient_id' => $recipientId,
-            ];
-        } catch (\Exception $e) {
-            throw new MessagingException('Failed to send message to YouTube: ' . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Reply to an existing conversation.
-     *
+     * @param string $accessToken
+     * @param string $tokenSecret
      * @param string $conversationId
      * @param string $message
      * @param array $options
      * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @throws MessagingException
      */
-    public function replyToConversation(string $conversationId, string $message, array $options = []): array
+    public function replyToConversation(string $accessToken, string $tokenSecret, string $conversationId, string $message, array $options = []): array
     {
-        try {
-            $socialConversation = SocialConversation::where('platform_conversation_id', $conversationId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if (!$socialConversation) {
-                throw new MessagingException('Conversation not found.');
-            }
-            
-            // Parse the conversation ID to get liveChatId
-            list($liveChatId, $recipientId) = explode('_', $conversationId);
-            
-            // Add live_chat_id to options
-            $options['live_chat_id'] = $liveChatId;
-            
-            return $this->sendMessage($recipientId, $message, $options);
-        } catch (\Exception $e) {
-            throw new MessagingException('Failed to reply to conversation on YouTube: ' . $e->getMessage());
-        }
+        // Replies are just new messages in the same live chat
+        return $this->sendMessage($accessToken, $tokenSecret, "", $conversationId, $message, $options);
     }
-    
+
     /**
-     * Mark a conversation as read.
+     * Mark a conversation as read (Not applicable to YouTube Live Chat).
      *
+     * @param string $accessToken
+     * @param string $tokenSecret
      * @param string $conversationId
      * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @throws MessagingException
      */
-    public function markConversationAsRead(string $conversationId): bool
+    public function markConversationAsRead(string $accessToken, string $tokenSecret, string $conversationId): bool
     {
-        try {
-            // YouTube doesn't have a concept of read/unread for messages
-            // We'll just update our local database
-            
-            $socialConversation = SocialConversation::where('platform_conversation_id', $conversationId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialConversation) {
-                $socialConversation->update([
-                    'is_read' => true,
-                ]);
-                
-                return true;
-            }
-            
-            return false;
-        } catch (\Exception $e) {
-            throw new MessagingException('Failed to mark conversation as read on YouTube: ' . $e->getMessage());
-        }
-    }
-    
-    /**
-     * Get the channel ID from the account metadata.
-     *
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
-     */
-    protected function getChannelId(): string
-    {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['channel_id'])) {
-            return $metadata['channel_id'];
-        }
-        
-        throw new MessagingException('YouTube channel ID not found in account metadata.');
+        // Live chat doesn't have a concept of marking conversations as read via API
+        throw new MessagingException("Marking conversations as read is not supported for YouTube Live Chat.");
     }
 }

@@ -3,590 +3,394 @@
 namespace VendorName\SocialConnect\Services\LinkedIn;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Storage;
 use VendorName\SocialConnect\Contracts\PublishableInterface;
 use VendorName\SocialConnect\Exceptions\PublishingException;
-use VendorName\SocialConnect\Models\SocialAccount;
-use VendorName\SocialConnect\Models\SocialPost;
 
 class LinkedInPublishingService implements PublishableInterface
 {
     /**
-     * The HTTP client instance.
+     * The HTTP client instance for LinkedIn API v2.
      *
      * @var \GuzzleHttp\Client
      */
     protected $client;
 
     /**
-     * The social account instance.
-     *
-     * @var \VendorName\SocialConnect\Models\SocialAccount
-     */
-    protected $account;
-
-    /**
      * Create a new LinkedInPublishingService instance.
-     *
-     * @param \VendorName\SocialConnect\Models\SocialAccount $account
      */
-    public function __construct(SocialAccount $account)
+    public function __construct()
     {
-        $this->account = $account;
         $this->client = new Client([
-            'base_uri' => 'https://api.linkedin.com/',
-            'timeout' => 30,
+            "base_uri" => "https://api.linkedin.com/v2/",
+            "timeout" => 120, // Longer timeout for potential uploads
         ]);
     }
 
     /**
-     * Publish a text post to LinkedIn.
+     * Get Guzzle client configured with Bearer token.
      *
-     * @param string $content
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @param string $accessToken User or Organization Access Token.
+     * @return Client
      */
-    public function publishText(string $content, array $options = []): array
+    protected function getApiClient(string $accessToken): Client
+    {
+        // Return a new client instance or configure the existing one
+        // Creating new ensures headers are fresh for each request
+        return new Client([
+            "base_uri" => $this->client->getConfig("base_uri"),
+            "timeout" => $this->client->getConfig("timeout"),
+            "headers" => [
+                "Authorization" => "Bearer " . $accessToken,
+                "Connection" => "Keep-Alive",
+                "X-Restli-Protocol-Version" => "2.0.0",
+                "Content-Type" => "application/json",
+                "Accept" => "application/json",
+            ],
+        ]);
+    }
+
+    /**
+     * Publish a text post (Share) as a User or Organization.
+     *
+     * @param string $accessToken User or Organization Access Token.
+     * @param string $tokenSecret Ignored (OAuth 2.0).
+     * @param string $targetId The URN of the author (e.g., "urn:li:person:{id}" or "urn:li:organization:{id}").
+     * @param string $text The text content of the share.
+     * @param array $options Additional options (e.g., visibility, lifecycleState).
+     * @return array Returns array with platform_post_id (Share URN).
+     * @throws PublishingException
+     */
+    public function publishText(string $accessToken, string $tokenSecret, string $targetId, string $text, array $options = []): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            $authorId = $options['company_id'] ?? $this->getUserUrn();
-            $isCompanyPost = isset($options['company_id']);
-            
-            // Prepare the post payload
+            $client = $this->getApiClient($accessToken);
             $payload = [
-                'author' => $authorId,
-                'lifecycleState' => 'PUBLISHED',
-                'specificContent' => [
-                    'com.linkedin.ugc.ShareContent' => [
-                        'shareCommentary' => [
-                            'text' => $content
+                "author" => $targetId,
+                "lifecycleState" => $options["lifecycleState"] ?? "PUBLISHED", // or DRAFT
+                "specificContent" => [
+                    "com.linkedin.ugc.ShareContent" => [
+                        "shareCommentary" => [
+                            "text" => $text,
                         ],
-                        'shareMediaCategory' => 'NONE'
-                    ]
+                        "shareMediaCategory" => "NONE",
+                    ],
                 ],
-                'visibility' => [
-                    'com.linkedin.ugc.MemberNetworkVisibility' => 'PUBLIC'
-                ]
+                "visibility" => [
+                    "com.linkedin.ugc.MemberNetworkVisibility" => $options["visibility"] ?? "PUBLIC", // CONNECTIONS, PUBLIC, LOGGED_IN
+                ],
             ];
-            
-            // Send the request
-            $response = $this->client->post('v2/ugcPosts', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'Content-Type' => 'application/json',
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-                'json' => $payload,
+
+            $response = $client->post("ugcPosts", [
+                "json" => $payload,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to publish text post to LinkedIn.');
+            $postId = $data["id"] ?? null; // Share URN (e.g., urn:li:share:12345)
+
+            if (!$postId) {
+                throw new PublishingException("Failed to publish LinkedIn text share. No ID returned.");
             }
-            
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'post_type' => 'text',
-                'status' => 'published',
-                'published_at' => now(),
-                'metadata' => [
-                    'author_id' => $authorId,
-                    'is_company_post' => $isCompanyPost,
-                ],
-            ]);
-            
+
             return [
-                'id' => $data['id'],
-                'platform' => 'linkedin',
-                'type' => 'text',
-                'url' => null, // LinkedIn API doesn't return the post URL directly
+                "platform" => "linkedin",
+                "platform_post_id" => $postId,
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish text post to LinkedIn: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new PublishingException("Failed to publish LinkedIn text share: " . $e->getMessage());
         }
     }
 
     /**
-     * Publish an image post to LinkedIn.
+     * Publish an image post (Share with image(s)).
      *
-     * @param string $content
-     * @param string|array $mediaUrls
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @param string $accessToken User or Organization Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $targetId Author URN.
+     * @param string $caption The text content of the share.
+     * @param string|array $imagePaths Path(s) to the image file(s).
+     * @param array $options Additional options.
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
      */
-    public function publishImage(string $content, $mediaUrls, array $options = []): array
+    public function publishImage(string $accessToken, string $tokenSecret, string $targetId, string $caption, $imagePaths, array $options = []): array
     {
+        $imagePaths = (array) $imagePaths;
         try {
-            $accessToken = $this->account->access_token;
-            $authorId = $options['company_id'] ?? $this->getUserUrn();
-            $isCompanyPost = isset($options['company_id']);
-            $mediaUrls = is_array($mediaUrls) ? $mediaUrls : [$mediaUrls];
-            
-            // Register image upload
-            $mediaAssets = [];
-            
-            foreach ($mediaUrls as $mediaUrl) {
-                // Step 1: Register the image upload
-                $registerResponse = $this->client->post('v2/assets?action=registerUpload', [
-                    'headers' => [
-                        'Authorization' => 'Bearer ' . $accessToken,
-                        'Content-Type' => 'application/json',
-                        'X-Restli-Protocol-Version' => '2.0.0',
-                    ],
-                    'json' => [
-                        'registerUploadRequest' => [
-                            'recipes' => [
-                                'com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest' => [
-                                    'uploadMedia' => 'urn:li:digitalmediaUploadType:feedshare-image',
-                                ],
-                            ],
-                            'owner' => $authorId,
-                            'serviceRelationships' => [
-                                [
-                                    'relationshipType' => 'OWNER',
-                                    'identifier' => 'urn:li:userGeneratedContent',
-                                ],
-                            ],
-                        ],
-                    ],
-                ]);
-                
-                $registerData = json_decode($registerResponse->getBody()->getContents(), true);
-                
-                if (!isset($registerData['value']['uploadMechanism']['com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest']['uploadUrl'])) {
-                    throw new PublishingException('Failed to register image upload with LinkedIn.');
-                }
-                
-                $uploadUrl = $registerData['value']['uploadMechanism']['com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest']['uploadUrl'];
-                $assetId = $registerData['value']['asset'];
-                
-                // Step 2: Upload the image
-                $imageContent = file_get_contents($mediaUrl);
-                
-                $uploadClient = new Client();
-                $uploadResponse = $uploadClient->put($uploadUrl, [
-                    'headers' => [
-                        'Authorization' => 'Bearer ' . $accessToken,
-                    ],
-                    'body' => $imageContent,
-                ]);
-                
-                if ($uploadResponse->getStatusCode() !== 201) {
-                    throw new PublishingException('Failed to upload image to LinkedIn.');
-                }
-                
-                $mediaAssets[] = $assetId;
+            $mediaUrns = [];
+            foreach ($imagePaths as $imagePath) {
+                $mediaUrns[] = $this->uploadMedia($accessToken, $targetId, $imagePath, "image");
             }
-            
-            // Step 3: Create the post with the uploaded image(s)
-            $mediaItems = [];
-            
-            foreach ($mediaAssets as $assetId) {
-                $mediaItems[] = [
-                    'status' => 'READY',
-                    'description' => [
-                        'text' => $options['image_description'] ?? 'Image',
-                    ],
-                    'media' => $assetId,
-                ];
-            }
-            
+
+            $client = $this->getApiClient($accessToken);
+            $mediaContent = array_map(function ($urn) {
+                return ["status" => "READY", "media" => $urn];
+            }, $mediaUrns);
+
             $payload = [
-                'author' => $authorId,
-                'lifecycleState' => 'PUBLISHED',
-                'specificContent' => [
-                    'com.linkedin.ugc.ShareContent' => [
-                        'shareCommentary' => [
-                            'text' => $content,
+                "author" => $targetId,
+                "lifecycleState" => $options["lifecycleState"] ?? "PUBLISHED",
+                "specificContent" => [
+                    "com.linkedin.ugc.ShareContent" => [
+                        "shareCommentary" => [
+                            "text" => $caption,
                         ],
-                        'shareMediaCategory' => 'IMAGE',
-                        'media' => $mediaItems,
+                        "shareMediaCategory" => "IMAGE",
+                        "media" => $mediaContent,
                     ],
                 ],
-                'visibility' => [
-                    'com.linkedin.ugc.MemberNetworkVisibility' => 'PUBLIC',
+                "visibility" => [
+                    "com.linkedin.ugc.MemberNetworkVisibility" => $options["visibility"] ?? "PUBLIC",
                 ],
             ];
-            
-            $response = $this->client->post('v2/ugcPosts', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'Content-Type' => 'application/json',
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-                'json' => $payload,
+
+            $response = $client->post("ugcPosts", [
+                "json" => $payload,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to publish image post to LinkedIn.');
+            $postId = $data["id"] ?? null;
+
+            if (!$postId) {
+                throw new PublishingException("Failed to publish LinkedIn image share. No ID returned.");
             }
-            
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'media_urls' => $mediaUrls,
-                'post_type' => 'image',
-                'status' => 'published',
-                'published_at' => now(),
-                'metadata' => [
-                    'author_id' => $authorId,
-                    'is_company_post' => $isCompanyPost,
-                    'asset_ids' => $mediaAssets,
-                ],
-            ]);
-            
+
             return [
-                'id' => $data['id'],
-                'platform' => 'linkedin',
-                'type' => 'image',
-                'url' => null, // LinkedIn API doesn't return the post URL directly
+                "platform" => "linkedin",
+                "platform_post_id" => $postId,
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish image post to LinkedIn: ' . $e->getMessage());
+        } catch (GuzzleException | \Exception $e) {
+            throw new PublishingException("Failed to publish LinkedIn image share: " . $e->getMessage());
         }
     }
 
     /**
-     * Publish a video post to LinkedIn.
+     * Publish a video post (Share with video).
      *
-     * @param string $content
-     * @param string $videoUrl
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
+     * @param string $accessToken User or Organization Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $targetId Author URN.
+     * @param string $description The text content of the share.
+     * @param string $videoPath Path to the video file.
+     * @param string|null $thumbnailPath Ignored (LinkedIn generates thumbnails).
+     * @param array $options Additional options.
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
      */
-    public function publishVideo(string $content, string $videoUrl, array $options = []): array
+    public function publishVideo(string $accessToken, string $tokenSecret, string $targetId, string $description, string $videoPath, ?string $thumbnailPath = null, array $options = []): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            $authorId = $options['company_id'] ?? $this->getUserUrn();
-            $isCompanyPost = isset($options['company_id']);
-            $title = $options['title'] ?? 'Video';
-            
-            // Step 1: Register the video upload
-            $registerResponse = $this->client->post('v2/assets?action=registerUpload', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'Content-Type' => 'application/json',
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-                'json' => [
-                    'registerUploadRequest' => [
-                        'recipes' => [
-                            'com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest' => [
-                                'uploadMedia' => 'urn:li:digitalmediaUploadType:feedshare-video',
-                            ],
+            $mediaUrn = $this->uploadMedia($accessToken, $targetId, $videoPath, "video");
+
+            $client = $this->getApiClient($accessToken);
+            $payload = [
+                "author" => $targetId,
+                "lifecycleState" => $options["lifecycleState"] ?? "PUBLISHED",
+                "specificContent" => [
+                    "com.linkedin.ugc.ShareContent" => [
+                        "shareCommentary" => [
+                            "text" => $description,
                         ],
-                        'owner' => $authorId,
-                        'serviceRelationships' => [
+                        "shareMediaCategory" => "VIDEO",
+                        "media" => [
                             [
-                                'relationshipType' => 'OWNER',
-                                'identifier' => 'urn:li:userGeneratedContent',
+                                "status" => "READY",
+                                "media" => $mediaUrn,
+                                // "title" => $options["video_title"] ?? basename($videoPath), // Optional video title
                             ],
                         ],
                     ],
                 ],
+                "visibility" => [
+                    "com.linkedin.ugc.MemberNetworkVisibility" => $options["visibility"] ?? "PUBLIC",
+                ],
+            ];
+
+            $response = $client->post("ugcPosts", [
+                "json" => $payload,
             ]);
-            
+
+            $data = json_decode($response->getBody()->getContents(), true);
+            $postId = $data["id"] ?? null;
+
+            if (!$postId) {
+                throw new PublishingException("Failed to publish LinkedIn video share. No ID returned.");
+            }
+
+            return [
+                "platform" => "linkedin",
+                "platform_post_id" => $postId,
+                "raw_response" => $data,
+            ];
+        } catch (GuzzleException | \Exception $e) {
+            throw new PublishingException("Failed to publish LinkedIn video share: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Publish a link post (Share with article).
+     *
+     * @param string $accessToken User or Organization Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $targetId Author URN.
+     * @param string $text The text content of the share.
+     * @param string $url The URL to share.
+     * @param array $options Additional options (e.g., thumbnail_url, title).
+     * @return array Returns array with platform_post_id.
+     * @throws PublishingException
+     */
+    public function publishLink(string $accessToken, string $tokenSecret, string $targetId, string $text, string $url, array $options = []): array
+    {
+        try {
+            $client = $this->getApiClient($accessToken);
+            $payload = [
+                "author" => $targetId,
+                "lifecycleState" => $options["lifecycleState"] ?? "PUBLISHED",
+                "specificContent" => [
+                    "com.linkedin.ugc.ShareContent" => [
+                        "shareCommentary" => [
+                            "text" => $text,
+                        ],
+                        "shareMediaCategory" => "ARTICLE",
+                        "media" => [
+                            [
+                                "status" => "READY",
+                                "originalUrl" => $url,
+                                // Optional: Provide title and thumbnail for better preview
+                                // "title" => ["text" => $options["link_title"] ?? ""],
+                                // "thumbnails" => isset($options["link_thumbnail_url"]) ? [[ "url" => $options["link_thumbnail_url"] ]] : [],
+                            ],
+                        ],
+                    ],
+                ],
+                "visibility" => [
+                    "com.linkedin.ugc.MemberNetworkVisibility" => $options["visibility"] ?? "PUBLIC",
+                ],
+            ];
+
+            $response = $client->post("ugcPosts", [
+                "json" => $payload,
+            ]);
+
+            $data = json_decode($response->getBody()->getContents(), true);
+            $postId = $data["id"] ?? null;
+
+            if (!$postId) {
+                throw new PublishingException("Failed to publish LinkedIn link share. No ID returned.");
+            }
+
+            return [
+                "platform" => "linkedin",
+                "platform_post_id" => $postId,
+                "raw_response" => $data,
+            ];
+        } catch (GuzzleException $e) {
+            throw new PublishingException("Failed to publish LinkedIn link share: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Delete a post (Share).
+     *
+     * @param string $accessToken User or Organization Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $postId The URN of the Share to delete (e.g., "urn:li:share:{id}" or "urn:li:ugcPost:{id}").
+     * @return bool Returns true on success.
+     * @throws PublishingException
+     */
+    public function deletePost(string $accessToken, string $tokenSecret, string $postId): bool
+    {
+        try {
+            $client = $this->getApiClient($accessToken);
+            // The endpoint depends on the type of URN, ugcPosts is more common now
+            $endpoint = str_contains($postId, ":ugcPost:") ? "ugcPosts/{$postId}" : "shares/{$postId}";
+
+            $response = $client->delete($endpoint);
+
+            // LinkedIn DELETE returns 204 No Content on success
+            return $response->getStatusCode() === 204;
+        } catch (GuzzleException $e) {
+            // Handle not found (404) or forbidden (403)
+            if ($e->getCode() === 404) {
+                return true; // Already deleted
+            }
+            throw new PublishingException("Failed to delete LinkedIn post: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Upload media (image/video) to LinkedIn.
+     *
+     * @param string $accessToken
+     * @param string $authorUrn
+     * @param string $mediaPath
+     * @param string $mediaType (
+     * @return string Media Asset URN.
+     * @throws PublishingException
+     */
+    protected function uploadMedia(string $accessToken, string $authorUrn, string $mediaPath, string $mediaType): string
+    {
+        if (!Storage::exists($mediaPath)) {
+            throw new PublishingException("Media file not found: {$mediaPath}");
+        }
+        $filePath = Storage::path($mediaPath);
+        $fileSize = filesize($filePath);
+
+        try {
+            $client = $this->getApiClient($accessToken);
+
+            // 1. Register Upload
+            $registerPayload = [
+                "registerUploadRequest" => [
+                    "owner" => $authorUrn,
+                    "recipes" => ["urn:li:digitalmediaRecipe:feedshare-" . strtolower($mediaType)],
+                    "serviceRelationships" => [
+                        [
+                            "relationshipType" => "OWNER",
+                            "identifier" => "urn:li:userGeneratedContent",
+                        ],
+                    ],
+                    // Optional: Add fileSizeBytes for validation
+                    // "fileSizeBytes" => $fileSize,
+                ],
+            ];
+            $registerResponse = $client->post("assets?action=registerUpload", [
+                "json" => $registerPayload,
+            ]);
             $registerData = json_decode($registerResponse->getBody()->getContents(), true);
-            
-            if (!isset($registerData['value']['uploadMechanism']['com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest']['uploadUrl'])) {
-                throw new PublishingException('Failed to register video upload with LinkedIn.');
+
+            if (!isset($registerData["value"]["uploadMechanism"]["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"]["uploadUrl"])) {
+                throw new PublishingException("Failed to register LinkedIn media upload.");
             }
-            
-            $uploadUrl = $registerData['value']['uploadMechanism']['com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest']['uploadUrl'];
-            $assetId = $registerData['value']['asset'];
-            
-            // Step 2: Upload the video
-            $videoContent = file_get_contents($videoUrl);
-            
-            $uploadClient = new Client();
+
+            $uploadUrl = $registerData["value"]["uploadMechanism"]["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"]["uploadUrl"];
+            $assetUrn = $registerData["value"]["asset"];
+
+            // 2. Upload Media File
+            $uploadClient = new Client(["timeout" => 180]); // Use a separate client for the actual upload potentially without auth headers
             $uploadResponse = $uploadClient->put($uploadUrl, [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'Content-Type' => 'video/mp4',
+                "headers" => [
+                    "Authorization" => "Bearer " . $accessToken, // Header might be needed depending on URL type
+                    "Content-Type" => mime_content_type($filePath),
+                    // "Content-Length" => $fileSize, // Guzzle adds this automatically
                 ],
-                'body' => $videoContent,
+                "body" => fopen($filePath, "r"),
             ]);
-            
-            if ($uploadResponse->getStatusCode() !== 201) {
-                throw new PublishingException('Failed to upload video to LinkedIn.');
+
+            if ($uploadResponse->getStatusCode() < 200 || $uploadResponse->getStatusCode() >= 300) {
+                throw new PublishingException("LinkedIn media file upload failed with status: " . $uploadResponse->getStatusCode());
             }
-            
-            // Step 3: Create the post with the uploaded video
-            $payload = [
-                'author' => $authorId,
-                'lifecycleState' => 'PUBLISHED',
-                'specificContent' => [
-                    'com.linkedin.ugc.ShareContent' => [
-                        'shareCommentary' => [
-                            'text' => $content,
-                        ],
-                        'shareMediaCategory' => 'VIDEO',
-                        'media' => [
-                            [
-                                'status' => 'READY',
-                                'description' => [
-                                    'text' => $options['video_description'] ?? 'Video',
-                                ],
-                                'media' => $assetId,
-                                'title' => [
-                                    'text' => $title,
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-                'visibility' => [
-                    'com.linkedin.ugc.MemberNetworkVisibility' => 'PUBLIC',
-                ],
-            ];
-            
-            $response = $this->client->post('v2/ugcPosts', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'Content-Type' => 'application/json',
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-                'json' => $payload,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to publish video post to LinkedIn.');
-            }
-            
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'media_urls' => [$videoUrl],
-                'post_type' => 'video',
-                'status' => 'published',
-                'published_at' => now(),
-                'metadata' => [
-                    'author_id' => $authorId,
-                    'is_company_post' => $isCompanyPost,
-                    'asset_id' => $assetId,
-                    'title' => $title,
-                ],
-            ]);
-            
-            return [
-                'id' => $data['id'],
-                'platform' => 'linkedin',
-                'type' => 'video',
-                'url' => null, // LinkedIn API doesn't return the post URL directly
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish video post to LinkedIn: ' . $e->getMessage());
-        }
-    }
 
-    /**
-     * Publish a link post to LinkedIn.
-     *
-     * @param string $content
-     * @param string $url
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function publishLink(string $content, string $url, array $options = []): array
-    {
-        try {
-            $accessToken = $this->account->access_token;
-            $authorId = $options['company_id'] ?? $this->getUserUrn();
-            $isCompanyPost = isset($options['company_id']);
-            $title = $options['title'] ?? '';
-            $description = $options['description'] ?? '';
-            
-            // Prepare the post payload
-            $payload = [
-                'author' => $authorId,
-                'lifecycleState' => 'PUBLISHED',
-                'specificContent' => [
-                    'com.linkedin.ugc.ShareContent' => [
-                        'shareCommentary' => [
-                            'text' => $content,
-                        ],
-                        'shareMediaCategory' => 'ARTICLE',
-                        'media' => [
-                            [
-                                'status' => 'READY',
-                                'originalUrl' => $url,
-                                'title' => [
-                                    'text' => $title,
-                                ],
-                                'description' => [
-                                    'text' => $description,
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-                'visibility' => [
-                    'com.linkedin.ugc.MemberNetworkVisibility' => 'PUBLIC',
-                ],
-            ];
-            
-            // Send the request
-            $response = $this->client->post('v2/ugcPosts', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'Content-Type' => 'application/json',
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-                'json' => $payload,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['id'])) {
-                throw new PublishingException('Failed to publish link post to LinkedIn.');
-            }
-            
-            // Create social post record
-            $post = $this->createSocialPost([
-                'platform_post_id' => $data['id'],
-                'content' => $content,
-                'post_type' => 'link',
-                'status' => 'published',
-                'published_at' => now(),
-                'metadata' => [
-                    'author_id' => $authorId,
-                    'is_company_post' => $isCompanyPost,
-                    'link' => $url,
-                    'title' => $title,
-                    'description' => $description,
-                ],
-            ]);
-            
-            return [
-                'id' => $data['id'],
-                'platform' => 'linkedin',
-                'type' => 'link',
-                'url' => null, // LinkedIn API doesn't return the post URL directly
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to publish link post to LinkedIn: ' . $e->getMessage());
-        }
-    }
+            // 3. Verify Upload (Optional but recommended for large files/videos)
+            // You might need to poll the asset status endpoint: GET /v2/assets/{assetURN}
 
-    /**
-     * Schedule a post for future publishing.
-     * Note: LinkedIn API doesn't support scheduling directly, so we'll store it locally and publish later.
-     *
-     * @param string $content
-     * @param \DateTime $scheduledAt
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function schedulePost(string $content, \DateTime $scheduledAt, array $options = []): array
-    {
-        try {
-            $postType = $options['post_type'] ?? 'text';
-            $authorId = $options['company_id'] ?? $this->getUserUrn();
-            $isCompanyPost = isset($options['company_id']);
-            
-            // Create a scheduled post record
-            $post = $this->createSocialPost([
-                'content' => $content,
-                'media_urls' => $options['media_urls'] ?? null,
-                'post_type' => $postType,
-                'status' => 'scheduled',
-                'scheduled_at' => $scheduledAt,
-                'metadata' => [
-                    'author_id' => $authorId,
-                    'is_company_post' => $isCompanyPost,
-                    'options' => $options,
-                ],
-            ]);
-            
-            return [
-                'id' => $post->id,
-                'platform' => 'linkedin',
-                'type' => $postType,
-                'scheduled_at' => $scheduledAt->format('Y-m-d H:i:s'),
-            ];
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to schedule post on LinkedIn: ' . $e->getMessage());
+            return $assetUrn;
+        } catch (GuzzleException | \Exception $e) {
+            throw new PublishingException("LinkedIn media upload process failed: " . $e->getMessage());
         }
-    }
-
-    /**
-     * Delete a post from LinkedIn.
-     *
-     * @param string $postId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    public function deletePost(string $postId): bool
-    {
-        try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->delete("v2/ugcPosts/{$postId}", [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-            ]);
-            
-            if ($response->getStatusCode() !== 204) {
-                throw new PublishingException('Failed to delete post from LinkedIn.');
-            }
-            
-            // Update social post record
-            SocialPost::where('platform_post_id', $postId)
-                ->where('platform', 'linkedin')
-                ->update(['status' => 'deleted']);
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new PublishingException('Failed to delete post from LinkedIn: ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Get the user URN from the account metadata.
-     *
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\PublishingException
-     */
-    protected function getUserUrn(): string
-    {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['id'])) {
-            return 'urn:li:person:' . $metadata['id'];
-        }
-        
-        throw new PublishingException('LinkedIn user ID not found in account metadata.');
-    }
-
-    /**
-     * Create a social post record.
-     *
-     * @param array $data
-     * @return \VendorName\SocialConnect\Models\SocialPost
-     */
-    protected function createSocialPost(array $data): SocialPost
-    {
-        return SocialPost::create(array_merge([
-            'user_id' => $this->account->user_id,
-            'social_account_id' => $this->account->id,
-            'platform' => 'linkedin',
-        ], $data));
     }
 }

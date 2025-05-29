@@ -3,676 +3,335 @@
 namespace VendorName\SocialConnect\Services\LinkedIn;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Config;
 use VendorName\SocialConnect\Contracts\MessagingInterface;
 use VendorName\SocialConnect\Exceptions\MessagingException;
-use VendorName\SocialConnect\Models\SocialAccount;
-use VendorName\SocialConnect\Models\SocialConversation;
-use VendorName\SocialConnect\Models\SocialMessage;
 
 class LinkedInMessagingService implements MessagingInterface
 {
     /**
-     * The HTTP client instance.
+     * The HTTP client instance for LinkedIn API v2.
      *
      * @var \GuzzleHttp\Client
      */
     protected $client;
 
     /**
-     * The social account instance.
-     *
-     * @var \VendorName\SocialConnect\Models\SocialAccount
-     */
-    protected $account;
-
-    /**
      * Create a new LinkedInMessagingService instance.
-     *
-     * @param \VendorName\SocialConnect\Models\SocialAccount $account
      */
-    public function __construct(SocialAccount $account)
+    public function __construct()
     {
-        $this->account = $account;
         $this->client = new Client([
-            'base_uri' => 'https://api.linkedin.com/v2/',
-            'timeout' => 30,
+            "base_uri" => "https://api.linkedin.com/v2/",
+            "timeout" => 60,
         ]);
     }
 
     /**
-     * Get conversations for the account.
+     * Get Guzzle client configured with Bearer token.
      *
-     * @param int $limit
-     * @param string|null $cursor
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @param string $accessToken User Access Token.
+     * @return Client
      */
-    public function getConversations(int $limit = 20, ?string $cursor = null): array
+    protected function getApiClient(string $accessToken): Client
+    {
+        return new Client([
+            "base_uri" => $this->client->getConfig("base_uri"),
+            "timeout" => $this->client->getConfig("timeout"),
+            "headers" => [
+                "Authorization" => "Bearer " . $accessToken,
+                "Connection" => "Keep-Alive",
+                "X-Restli-Protocol-Version" => "2.0.0",
+                "Content-Type" => "application/json",
+                "Accept" => "application/json",
+            ],
+        ]);
+    }
+
+    /**
+     * Get conversations (Messaging API).
+     *
+     * @param string $accessToken User Access Token with messaging permissions.
+     * @param string $tokenSecret Ignored.
+     * @param string $targetId The User URN (urn:li:person:{id}) of the authenticated user.
+     * @param int $limit Maximum number of conversations to return.
+     * @param string|null $cursor Pagination marker (not standard cursor, often uses createdBefore timestamp).
+     * @return array Returns array containing conversations and next cursor info.
+     * @throws MessagingException
+     */
+    public function getConversations(string $accessToken, string $tokenSecret, string $targetId, int $limit = 20, ?string $cursor = null): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            
+            $client = $this->getApiClient($accessToken);
             $params = [
-                'count' => $limit,
-                'q' => 'findConversations',
+                "q" => "participants",
+                "participants" => $targetId, // Filter by the authenticated user
+                "sort" => "LAST_MODIFIED",
+                "count" => $limit,
+                // LinkedIn uses createdBefore for pagination typically
+                // "createdBefore" => $cursor, // Assuming cursor is a timestamp in milliseconds
             ];
-            
-            if ($cursor) {
-                $params['start'] = $cursor;
+            if ($cursor && is_numeric($cursor)) {
+                 $params["createdBefore"] = $cursor;
             }
-            
-            $response = $this->client->get('messaging/conversations', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-                'query' => $params,
+
+            // Projection to get needed fields
+            $params["projection"] = "(elements(*(id,created,lastModified,participantsDetails*~(localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams)),lastActivityAt,read,totalMessageCount,versionTag)),paging)";
+
+            $response = $client->get("conversations", [
+                "query" => $params,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['elements'])) {
-                throw new MessagingException('Failed to retrieve conversations from LinkedIn.');
+
+            if (!isset($data["elements"])) {
+                throw new MessagingException("Failed to retrieve conversations from LinkedIn.");
             }
-            
-            $conversations = [];
+
+            $conversations = $data["elements"];
+            // Determine next cursor (e.g., last conversation's lastModified timestamp)
             $nextCursor = null;
-            
-            // Check if there are more conversations
-            if (isset($data['paging']) && isset($data['paging']['count']) && isset($data['paging']['start']) && count($data['elements']) >= $data['paging']['count']) {
-                $nextCursor = $data['paging']['start'] + $data['paging']['count'];
+            if (!empty($conversations)) {
+                $lastConversation = end($conversations);
+                $nextCursor = $lastConversation["lastModified"] ?? null;
             }
-            
-            foreach ($data['elements'] as $conversation) {
-                $conversationId = $conversation['entityUrn'] ?? null;
-                if (!$conversationId) {
-                    continue;
+
+            // Format the output
+            $formattedConversations = array_map(function ($conv) {
+                $participants = [];
+                foreach ($conv["participantsDetails"] ?? [] as $detail) {
+                    $participants[] = [
+                        "id" => $detail["entityUrn"],
+                        "name" => ($detail["localizedFirstName"] ?? "") . " " . ($detail["localizedLastName"] ?? ""),
+                        "avatar" => $detail["profilePicture"]["displayImage~"]["elements"][0]["identifiers"][0]["identifier"] ?? null,
+                    ];
                 }
-                
-                // Extract the conversation ID from the URN
-                $conversationId = str_replace('urn:li:messaging:conversation:', '', $conversationId);
-                
-                // Get participants
-                $participants = $conversation['participants'] ?? [];
-                $recipientId = null;
-                $recipientName = null;
-                
-                foreach ($participants as $participant) {
-                    if ($participant['entityUrn'] !== 'urn:li:person:' . $this->getUserId()) {
-                        $recipientId = str_replace('urn:li:person:', '', $participant['entityUrn']);
-                        
-                        // Get recipient profile
-                        try {
-                            $profileResponse = $this->client->get('people/' . $recipientId, [
-                                'headers' => [
-                                    'Authorization' => 'Bearer ' . $accessToken,
-                                ],
-                                'query' => [
-                                    'projection' => '(id,firstName,lastName,profilePicture)',
-                                ],
-                            ]);
-                            
-                            $profileData = json_decode($profileResponse->getBody()->getContents(), true);
-                            
-                            $firstName = $profileData['firstName']['localized']['en_US'] ?? '';
-                            $lastName = $profileData['lastName']['localized']['en_US'] ?? '';
-                            $recipientName = trim($firstName . ' ' . $lastName);
-                            
-                            $recipientAvatar = null;
-                            if (isset($profileData['profilePicture']['displayImage~']['elements'][0]['identifiers'][0]['identifier'])) {
-                                $recipientAvatar = $profileData['profilePicture']['displayImage~']['elements'][0]['identifiers'][0]['identifier'];
-                            }
-                        } catch (\Exception $e) {
-                            // Ignore profile fetch errors
-                        }
-                        
-                        break;
-                    }
-                }
-                
-                // Get last message
-                $lastMessage = null;
-                $lastMessageTime = null;
-                $unreadCount = 0;
-                
-                if (isset($conversation['events']) && !empty($conversation['events'])) {
-                    $lastEvent = $conversation['events'][0];
-                    
-                    if (isset($lastEvent['eventContent']['com.linkedin.voyager.messaging.event.MessageEvent'])) {
-                        $messageEvent = $lastEvent['eventContent']['com.linkedin.voyager.messaging.event.MessageEvent'];
-                        $lastMessage = $messageEvent['body'] ?? null;
-                        $lastMessageTime = $lastEvent['createdAt'] ?? null;
-                        
-                        // Check if message is read
-                        if (isset($lastEvent['fromEntity']) && $lastEvent['fromEntity'] !== 'urn:li:person:' . $this->getUserId()) {
-                            if (!isset($lastEvent['read']) || !$lastEvent['read']) {
-                                $unreadCount++;
-                            }
-                        }
-                    }
-                }
-                
-                // Store in database
-                $socialConversation = SocialConversation::updateOrCreate(
-                    [
-                        'social_account_id' => $this->account->id,
-                        'platform_conversation_id' => $conversationId,
-                    ],
-                    [
-                        'user_id' => $this->account->user_id,
-                        'platform' => 'linkedin',
-                        'recipient_id' => $recipientId,
-                        'recipient_name' => $recipientName,
-                        'recipient_avatar' => $recipientAvatar ?? null,
-                        'last_message_at' => $lastMessageTime ? new \DateTime('@' . ($lastMessageTime / 1000)) : now(),
-                        'is_read' => $unreadCount === 0,
-                        'metadata' => [
-                            'unread_count' => $unreadCount,
-                            'snippet' => $lastMessage,
-                        ],
-                    ]
-                );
-                
-                $conversations[] = [
-                    'id' => $socialConversation->id,
-                    'platform_conversation_id' => $conversationId,
-                    'recipient_id' => $recipientId,
-                    'recipient_name' => $recipientName,
-                    'recipient_avatar' => $recipientAvatar ?? null,
-                    'last_message_at' => $lastMessageTime ? date('c', $lastMessageTime / 1000) : null,
-                    'is_read' => $unreadCount === 0,
-                    'snippet' => $lastMessage,
-                    'unread_count' => $unreadCount,
+                return [
+                    "platform_conversation_id" => $conv["id"], // e.g., urn:li:conversation:123
+                    "participants" => $participants,
+                    "updated_time" => isset($conv["lastModified"]) ? date("c", $conv["lastModified"] / 1000) : null,
+                    "snippet" => null, // Not directly available
+                    "unread_count" => $conv["read"] ? 0 : ($conv["totalMessageCount"] ?? 1), // Approximation
+                    "message_count" => $conv["totalMessageCount"] ?? 0,
+                    "can_reply" => true, // Assume true unless API indicates otherwise
                 ];
-            }
-            
+            }, $conversations);
+
             return [
-                'conversations' => $conversations,
-                'next_cursor' => $nextCursor,
+                "platform" => "linkedin",
+                "user_id" => $targetId,
+                "conversations" => $formattedConversations,
+                "next_cursor" => $nextCursor, // Timestamp for createdBefore
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new MessagingException('Failed to get conversations from LinkedIn: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new MessagingException("Failed to get LinkedIn conversations: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Get messages for a specific conversation.
      *
-     * @param string $conversationId
-     * @param int $limit
-     * @param string|null $cursor
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @param string $accessToken User Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $conversationId The Conversation URN (e.g., "urn:li:conversation:{id}").
+     * @param int $limit Maximum number of messages to return.
+     * @param string|null $cursor Pagination marker (createdBefore timestamp).
+     * @return array Returns array containing messages and next cursor info.
+     * @throws MessagingException
      */
-    public function getMessages(string $conversationId, int $limit = 20, ?string $cursor = null): array
+    public function getMessages(string $accessToken, string $tokenSecret, string $conversationId, int $limit = 20, ?string $cursor = null): array
     {
         try {
-            $accessToken = $this->account->access_token;
-            $userId = $this->getUserId();
-            
+            $client = $this->getApiClient($accessToken);
             $params = [
-                'count' => $limit,
-                'q' => 'conversation',
+                "q" => "conversation",
+                "conversation" => $conversationId,
+                "sort" => "CREATED", // Get newest first
+                "count" => $limit,
             ];
-            
-            if ($cursor) {
-                $params['start'] = $cursor;
+            if ($cursor && is_numeric($cursor)) {
+                 $params["createdBefore"] = $cursor;
             }
-            
-            $response = $this->client->get('messaging/conversations/' . $conversationId . '/events', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                ],
-                'query' => $params,
+
+            // Projection for message details
+            $params["projection"] = "(elements(*(id,created,sender~(localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams)),body,attachments*~(*))),paging)";
+
+            $response = $client->get("messages", [
+                "query" => $params,
             ]);
-            
+
             $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['elements'])) {
-                throw new MessagingException('Failed to retrieve messages from LinkedIn.');
+
+            if (!isset($data["elements"])) {
+                throw new MessagingException("Failed to retrieve messages from LinkedIn conversation.");
             }
-            
-            // Get the conversation from database
-            $socialConversation = SocialConversation::where('platform_conversation_id', $conversationId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if (!$socialConversation) {
-                // Create the conversation if it doesn't exist
-                $socialConversation = SocialConversation::create([
-                    'user_id' => $this->account->user_id,
-                    'social_account_id' => $this->account->id,
-                    'platform' => 'linkedin',
-                    'platform_conversation_id' => $conversationId,
-                    'last_message_at' => now(),
-                ]);
-            }
-            
-            $messages = [];
+
+            $messages = $data["elements"];
             $nextCursor = null;
-            
-            // Check if there are more messages
-            if (isset($data['paging']) && isset($data['paging']['count']) && isset($data['paging']['start']) && count($data['elements']) >= $data['paging']['count']) {
-                $nextCursor = $data['paging']['start'] + $data['paging']['count'];
+            if (!empty($messages)) {
+                $lastMessage = end($messages);
+                $nextCursor = $lastMessage["created"] ?? null;
             }
-            
-            foreach ($data['elements'] as $event) {
-                // Only process message events
-                if (!isset($event['eventContent']['com.linkedin.voyager.messaging.event.MessageEvent'])) {
-                    continue;
-                }
-                
-                $messageEvent = $event['eventContent']['com.linkedin.voyager.messaging.event.MessageEvent'];
-                $messageId = $event['entityUrn'] ?? null;
-                if (!$messageId) {
-                    continue;
-                }
-                
-                // Extract the message ID from the URN
-                $messageId = str_replace('urn:li:messagingEvent:', '', $messageId);
-                
-                $messageText = $messageEvent['body'] ?? '';
-                $senderId = null;
-                if (isset($event['fromEntity'])) {
-                    $senderId = str_replace('urn:li:person:', '', $event['fromEntity']);
-                }
-                
-                $createdAt = $event['createdAt'] ?? null;
-                $isFromMe = $senderId === $userId;
-                
-                // Get sender details
-                $senderName = null;
-                if ($isFromMe) {
-                    $senderName = $this->account->name;
-                } else if ($senderId) {
-                    try {
-                        $profileResponse = $this->client->get('people/' . $senderId, [
-                            'headers' => [
-                                'Authorization' => 'Bearer ' . $accessToken,
-                            ],
-                            'query' => [
-                                'projection' => '(id,firstName,lastName)',
-                            ],
-                        ]);
-                        
-                        $profileData = json_decode($profileResponse->getBody()->getContents(), true);
-                        
-                        $firstName = $profileData['firstName']['localized']['en_US'] ?? '';
-                        $lastName = $profileData['lastName']['localized']['en_US'] ?? '';
-                        $senderName = trim($firstName . ' ' . $lastName);
-                    } catch (\Exception $e) {
-                        // Ignore profile fetch errors
-                    }
-                }
-                
-                // Process attachments
-                $attachments = [];
-                
-                if (isset($messageEvent['attachments']) && !empty($messageEvent['attachments'])) {
-                    foreach ($messageEvent['attachments'] as $attachment) {
-                        if (isset($attachment['reference'])) {
-                            $attachments[] = [
-                                'type' => $attachment['reference']['com.linkedin.voyager.messaging.MessagingAttachmentReference']['type'] ?? 'unknown',
-                                'name' => $attachment['reference']['com.linkedin.voyager.messaging.MessagingAttachmentReference']['name'] ?? null,
-                                'size' => $attachment['reference']['com.linkedin.voyager.messaging.MessagingAttachmentReference']['size'] ?? null,
-                                'url' => $attachment['reference']['com.linkedin.voyager.messaging.MessagingAttachmentReference']['url'] ?? null,
-                            ];
-                        }
-                    }
-                }
-                
-                // Store in database
-                $socialMessage = SocialMessage::updateOrCreate(
-                    [
-                        'social_conversation_id' => $socialConversation->id,
-                        'platform_message_id' => $messageId,
-                    ],
-                    [
-                        'user_id' => $this->account->user_id,
-                        'social_account_id' => $this->account->id,
-                        'platform' => 'linkedin',
-                        'message' => $messageText,
-                        'sender_id' => $senderId,
-                        'sender_name' => $senderName,
-                        'is_from_me' => $isFromMe,
-                        'is_read' => true,
-                        'attachments' => $attachments,
-                        'metadata' => [
-                            'created_at' => $createdAt ? date('c', $createdAt / 1000) : null,
-                        ],
-                    ]
-                );
-                
-                $messages[] = [
-                    'id' => $socialMessage->id,
-                    'platform_message_id' => $messageId,
-                    'message' => $messageText,
-                    'sender_id' => $senderId,
-                    'sender_name' => $senderName,
-                    'is_from_me' => $isFromMe,
-                    'created_at' => $createdAt ? date('c', $createdAt / 1000) : null,
-                    'attachments' => $attachments,
+
+            // Format the output
+            $formattedMessages = array_map(function ($msg) {
+                $sender = $msg["sender"] ?? null;
+                return [
+                    "platform_message_id" => $msg["id"], // e.g., urn:li:message:123
+                    "created_time" => isset($msg["created"]) ? date("c", $msg["created"] / 1000) : null,
+                    "from" => $sender ? [
+                        "id" => $sender["entityUrn"],
+                        "name" => ($sender["localizedFirstName"] ?? "") . " " . ($sender["localizedLastName"] ?? ""),
+                        "avatar" => $sender["profilePicture"]["displayImage~"]["elements"][0]["identifiers"][0]["identifier"] ?? null,
+                    ] : null,
+                    "to" => [], // Not directly available in message object, inferred from conversation
+                    "message" => $msg["body"]["text"] ?? null,
+                    "attachments" => $msg["attachments"] ?? [],
+                    "shares" => [], // Shares not typically part of message object
+                    "sticker" => null, // No stickers on LinkedIn
                 ];
-            }
-            
-            // Mark conversation as read
-            $socialConversation->update([
-                'is_read' => true,
-                'last_message_at' => now(),
-            ]);
-            
+            }, $messages);
+
             return [
-                'conversation_id' => $socialConversation->id,
-                'platform_conversation_id' => $conversationId,
-                'messages' => $messages,
-                'next_cursor' => $nextCursor,
+                "platform" => "linkedin",
+                "conversation_id" => $conversationId,
+                "messages" => $formattedMessages,
+                "next_cursor" => $nextCursor, // Timestamp for createdBefore
+                "raw_response" => $data,
             ];
-        } catch (\Exception $e) {
-            throw new MessagingException('Failed to get messages from LinkedIn: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new MessagingException("Failed to get LinkedIn messages: " . $e->getMessage());
         }
     }
-    
+
     /**
-     * Send a new message to a recipient.
+     * Send a new message or reply to a conversation.
      *
-     * @param string $recipientId
-     * @param string $message
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @param string $accessToken User Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $targetId Authenticated User URN (for context).
+     * @param string $recipientId Conversation URN OR Recipient User URN (for new conversation).
+     * @param string $message The text message content.
+     * @param array $options Additional options (e.g., conversation_urn for reply).
+     * @return array Returns array with platform_message_id.
+     * @throws MessagingException
      */
-    public function sendMessage(string $recipientId, string $message, array $options = []): array
+    public function sendMessage(string $accessToken, string $tokenSecret, string $targetId, string $recipientId, string $message, array $options = []): array
     {
+        // LinkedIn uses the same endpoint for new messages and replies.
+        // If conversation_urn is provided in options, it's a reply.
+        // If recipientId is a user URN, it starts a new conversation.
         try {
-            $accessToken = $this->account->access_token;
-            
-            // Create conversation if it doesn't exist
-            $conversationResponse = $this->client->post('messaging/conversations', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => [
-                    'recipients' => [
-                        'urn:li:person:' . $recipientId,
-                    ],
-                ],
-            ]);
-            
-            $conversationData = json_decode($conversationResponse->getBody()->getContents(), true);
-            
-            if (!isset($conversationData['entityUrn'])) {
-                throw new MessagingException('Failed to create conversation on LinkedIn.');
-            }
-            
-            $conversationId = str_replace('urn:li:messaging:conversation:', '', $conversationData['entityUrn']);
-            
-            // Send message
+            $client = $this->getApiClient($accessToken);
+
             $payload = [
-                'com.linkedin.voyager.messaging.create.MessageCreate' => [
-                    'body' => $message,
-                    'attachments' => [],
-                    'attributedBody' => [
-                        'text' => $message,
-                        'attributes' => [],
-                    ],
-                    'messageRequestContextUrn' => null,
+                "recipients" => [], // Will be populated based on context
+                "body" => [
+                    "text" => $message,
                 ],
+                // "sender" => $targetId, // Optional: Specify sender if needed
             ];
-            
-            // Add attachments if provided
-            if (isset($options['attachment_id'])) {
-                $payload['com.linkedin.voyager.messaging.create.MessageCreate']['attachments'][] = [
-                    'reference' => $options['attachment_id'],
-                ];
-            }
-            
-            $response = $this->client->post('messaging/conversations/' . $conversationId . '/events', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => $payload,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['entityUrn'])) {
-                throw new MessagingException('Failed to send message to LinkedIn.');
-            }
-            
-            $messageId = str_replace('urn:li:messagingEvent:', '', $data['entityUrn']);
-            
-            // Get recipient details
-            $recipientName = null;
-            $recipientAvatar = null;
-            
-            try {
-                $profileResponse = $this->client->get('people/' . $recipientId, [
-                    'headers' => [
-                        'Authorization' => 'Bearer ' . $accessToken,
-                    ],
-                    'query' => [
-                        'projection' => '(id,firstName,lastName,profilePicture)',
-                    ],
-                ]);
-                
-                $profileData = json_decode($profileResponse->getBody()->getContents(), true);
-                
-                $firstName = $profileData['firstName']['localized']['en_US'] ?? '';
-                $lastName = $profileData['lastName']['localized']['en_US'] ?? '';
-                $recipientName = trim($firstName . ' ' . $lastName);
-                
-                if (isset($profileData['profilePicture']['displayImage~']['elements'][0]['identifiers'][0]['identifier'])) {
-                    $recipientAvatar = $profileData['profilePicture']['displayImage~']['elements'][0]['identifiers'][0]['identifier'];
-                }
-            } catch (\Exception $e) {
-                // Ignore profile fetch errors
-            }
-            
-            // Find or create conversation
-            $socialConversation = SocialConversation::where('platform_conversation_id', $conversationId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if (!$socialConversation) {
-                // Create new conversation
-                $socialConversation = SocialConversation::create([
-                    'user_id' => $this->account->user_id,
-                    'social_account_id' => $this->account->id,
-                    'platform' => 'linkedin',
-                    'platform_conversation_id' => $conversationId,
-                    'recipient_id' => $recipientId,
-                    'recipient_name' => $recipientName,
-                    'recipient_avatar' => $recipientAvatar,
-                    'last_message_at' => now(),
-                    'is_read' => true,
-                ]);
+
+            if (isset($options["conversation_urn"])) {
+                // Replying to an existing conversation
+                $payload["conversation"] = $options["conversation_urn"];
+                // Recipients are inferred from the conversation, but can be specified if needed
             } else {
-                // Update existing conversation
-                $socialConversation->update([
-                    'last_message_at' => now(),
-                    'is_read' => true,
-                ]);
+                // Starting a new conversation
+                // recipientId should be the User URN
+                if (!str_contains($recipientId, "urn:li:person:")) {
+                    throw new MessagingException("Recipient ID must be a valid User URN (urn:li:person:{id}) for starting a new conversation.");
+                }
+                $payload["recipients"] = [$recipientId];
             }
-            
-            // Store message
-            $socialMessage = SocialMessage::create([
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'social_conversation_id' => $socialConversation->id,
-                'platform' => 'linkedin',
-                'platform_message_id' => $messageId,
-                'message' => $message,
-                'sender_id' => $this->getUserId(),
-                'sender_name' => $this->account->name,
-                'is_from_me' => true,
-                'is_read' => true,
-                'attachments' => isset($options['attachment_id']) ? [['id' => $options['attachment_id']]] : [],
+
+            // Add attachments if provided
+            // Requires uploading media first and getting URNs - complex, omitted for brevity
+            // if (isset($options["attachment_urns"])) {
+            //     $payload["attachments"] = array_map(fn($urn) => ["entity" => $urn], $options["attachment_urns"]);
+            // }
+
+            $response = $client->post("messages", [
+                "json" => $payload,
             ]);
-            
+
+            // Response contains the Location header with the new message URN
+            $locationHeader = $response->getHeaderLine("Location");
+            $messageUrn = $locationHeader ?: null;
+
+            if (!$messageUrn) {
+                // Fallback: Try parsing body if available (though 201 usually has empty body)
+                $data = json_decode($response->getBody()->getContents(), true);
+                $messageUrn = $data["id"] ?? null;
+            }
+
+            if (!$messageUrn) {
+                throw new MessagingException("Failed to send LinkedIn message. No message URN returned.");
+            }
+
             return [
-                'success' => true,
-                'message_id' => $messageId,
-                'conversation_id' => $socialConversation->id,
-                'platform_conversation_id' => $conversationId,
-                'recipient_id' => $recipientId,
+                "platform" => "linkedin",
+                "platform_message_id" => $messageUrn,
+                "recipient_id" => $recipientId, // Contextual recipient
+                "raw_response" => ["LocationHeader" => $locationHeader], // Minimal raw response
             ];
-        } catch (\Exception $e) {
-            throw new MessagingException('Failed to send message to LinkedIn: ' . $e->getMessage());
+        } catch (GuzzleException $e) {
+            throw new MessagingException("Failed to send LinkedIn message: " . $e->getMessage());
         }
     }
-    
+
     /**
      * Reply to an existing conversation.
      *
-     * @param string $conversationId
-     * @param string $message
-     * @param array $options
-     * @return array
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @param string $accessToken User Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $conversationId The Conversation URN.
+     * @param string $message The text message content.
+     * @param array $options Additional options.
+     * @return array Returns array with platform_message_id.
+     * @throws MessagingException
      */
-    public function replyToConversation(string $conversationId, string $message, array $options = []): array
+    public function replyToConversation(string $accessToken, string $tokenSecret, string $conversationId, string $message, array $options = []): array
     {
-        try {
-            $accessToken = $this->account->access_token;
-            
-            // Send message
-            $payload = [
-                'com.linkedin.voyager.messaging.create.MessageCreate' => [
-                    'body' => $message,
-                    'attachments' => [],
-                    'attributedBody' => [
-                        'text' => $message,
-                        'attributes' => [],
-                    ],
-                    'messageRequestContextUrn' => null,
-                ],
-            ];
-            
-            // Add attachments if provided
-            if (isset($options['attachment_id'])) {
-                $payload['com.linkedin.voyager.messaging.create.MessageCreate']['attachments'][] = [
-                    'reference' => $options['attachment_id'],
-                ];
-            }
-            
-            $response = $this->client->post('messaging/conversations/' . $conversationId . '/events', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => $payload,
-            ]);
-            
-            $data = json_decode($response->getBody()->getContents(), true);
-            
-            if (!isset($data['entityUrn'])) {
-                throw new MessagingException('Failed to reply to conversation on LinkedIn.');
-            }
-            
-            $messageId = str_replace('urn:li:messagingEvent:', '', $data['entityUrn']);
-            
-            // Get the conversation from database
-            $socialConversation = SocialConversation::where('platform_conversation_id', $conversationId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if (!$socialConversation) {
-                throw new MessagingException('Conversation not found.');
-            }
-            
-            // Update conversation
-            $socialConversation->update([
-                'last_message_at' => now(),
-                'is_read' => true,
-            ]);
-            
-            // Store message
-            $socialMessage = SocialMessage::create([
-                'user_id' => $this->account->user_id,
-                'social_account_id' => $this->account->id,
-                'social_conversation_id' => $socialConversation->id,
-                'platform' => 'linkedin',
-                'platform_message_id' => $messageId,
-                'message' => $message,
-                'sender_id' => $this->getUserId(),
-                'sender_name' => $this->account->name,
-                'is_from_me' => true,
-                'is_read' => true,
-                'attachments' => isset($options['attachment_id']) ? [['id' => $options['attachment_id']]] : [],
-            ]);
-            
-            return [
-                'success' => true,
-                'message_id' => $messageId,
-                'conversation_id' => $socialConversation->id,
-                'platform_conversation_id' => $conversationId,
-                'recipient_id' => $socialConversation->recipient_id,
-            ];
-        } catch (\Exception $e) {
-            throw new MessagingException('Failed to reply to conversation on LinkedIn: ' . $e->getMessage());
-        }
+        // Use sendMessage with the conversation_urn option
+        $options["conversation_urn"] = $conversationId;
+        // Target ID (sender) and recipient ID (conversation) are passed
+        return $this->sendMessage($accessToken, $tokenSecret, "", $conversationId, $message, $options);
     }
-    
+
     /**
      * Mark a conversation as read.
      *
-     * @param string $conversationId
-     * @return bool
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
+     * @param string $accessToken User Access Token.
+     * @param string $tokenSecret Ignored.
+     * @param string $conversationId The Conversation URN.
+     * @return bool Returns true on success.
+     * @throws MessagingException
      */
-    public function markConversationAsRead(string $conversationId): bool
+    public function markConversationAsRead(string $accessToken, string $tokenSecret, string $conversationId): bool
     {
         try {
-            $accessToken = $this->account->access_token;
-            
-            $response = $this->client->post('messaging/conversations/' . $conversationId . '/receipts', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $accessToken,
-                    'X-Restli-Protocol-Version' => '2.0.0',
-                    'Content-Type' => 'application/json',
+            $client = $this->getApiClient($accessToken);
+            // LinkedIn uses a PATCH request with a specific JSON structure
+            $payload = [
+                "patch" => [
+                    "$set" => [
+                        "read" => true,
+                    ],
                 ],
-                'json' => [
-                    'read' => true,
-                ],
+            ];
+
+            $response = $client->post("conversations/{$conversationId}", [
+                "headers" => ["X-Restli-Method" => "PARTIAL_UPDATE"], // Crucial header for PATCH
+                "json" => $payload,
             ]);
-            
-            // Update in database
-            $socialConversation = SocialConversation::where('platform_conversation_id', $conversationId)
-                ->where('social_account_id', $this->account->id)
-                ->first();
-            
-            if ($socialConversation) {
-                $socialConversation->update([
-                    'is_read' => true,
-                ]);
-            }
-            
-            return true;
-        } catch (\Exception $e) {
-            throw new MessagingException('Failed to mark conversation as read on LinkedIn: ' . $e->getMessage());
+
+            // LinkedIn returns 204 No Content on success
+            return $response->getStatusCode() === 204;
+        } catch (GuzzleException $e) {
+            throw new MessagingException("Failed to mark LinkedIn conversation as read: " . $e->getMessage());
         }
-    }
-    
-    /**
-     * Get the user ID from the account metadata.
-     *
-     * @return string
-     * @throws \VendorName\SocialConnect\Exceptions\MessagingException
-     */
-    protected function getUserId(): string
-    {
-        $metadata = $this->account->metadata;
-        
-        if (isset($metadata['id'])) {
-            return $metadata['id'];
-        }
-        
-        throw new MessagingException('LinkedIn user ID not found in account metadata.');
     }
 }
