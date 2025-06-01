@@ -1,7 +1,7 @@
 # Laravel Social Connect (Stateless Edition)
 
-[![Latest Version on Packagist](https://img.shields.io/packagist/v/your-vendor/laravel-social-connect.svg?style=flat-square)](https://packagist.org/packages/your-vendor/laravel-social-connect)
-[![Total Downloads](https://img.shields.io/packagist/dt/your-vendor/laravel-social-connect.svg?style=flat-square)](https://packagist.org/packages/your-vendor/laravel-social-connect)
+[![Latest Version on Packagist](https://img.shields.io/packagist/v/jerry4rahul/laravel-social-connect.svg?style=flat-square)](https://packagist.org/packages/jerry4rahul/laravel-social-connect)
+[![Total Downloads](https://img.shields.io/packagist/dt/jerry4rahul/laravel-social-connect.svg?style=flat-square)](https://packagist.org/packages/jerry4rahul/laravel-social-connect)
 
 **Connect and interact with multiple social media platforms (Facebook Pages, Instagram Business/Creator, Twitter/X, LinkedIn Company Pages, YouTube Channels) directly from your Laravel application.**
 
@@ -11,27 +11,27 @@ This approach provides maximum flexibility, allowing you to integrate the packag
 
 ## Features
 
-*   **Multi-Platform Support:** Facebook, Instagram, Twitter/X, LinkedIn, YouTube.
-*   **Authentication:** Handles OAuth 2.0 (and OAuth 1.0a for Twitter) flows to obtain access tokens (you store the tokens).
-*   **Publishing:** Publish text, images, videos, and links to supported platforms.
-*   **Metrics & Insights:** Retrieve account-level and post-level analytics.
-*   **Direct Messaging:** Fetch conversations/messages and send replies (where supported by API, e.g., Facebook Pages, Instagram, Twitter DM, LinkedIn Messaging, YouTube Live Chat).
-*   **Comment Management:** Fetch comments/replies, post new comments/replies, like, moderate (hide/delete).
-*   **Stateless Design:** Provides services to interact with APIs; you manage data persistence.
-*   **Consistent Interface:** Uses a `SocialConnectManager` and platform-specific services for easy interaction.
+- **Multi-Platform Support:** Facebook, Instagram, Twitter/X, LinkedIn, YouTube.
+- **Authentication:** Handles OAuth 2.0 (and OAuth 1.0a for Twitter) flows to obtain access tokens (you store the tokens).
+- **Publishing:** Publish text, images, videos, and links to supported platforms.
+- **Metrics & Insights:** Retrieve account-level and post-level analytics.
+- **Direct Messaging:** Fetch conversations/messages and send replies (where supported by API, e.g., Facebook Pages, Instagram, Twitter DM, LinkedIn Messaging, YouTube Live Chat).
+- **Comment Management:** Fetch comments/replies, post new comments/replies, like, moderate (hide/delete).
+- **Stateless Design:** Provides services to interact with APIs; you manage data persistence.
+- **Consistent Interface:** Uses a `SocialConnectManager` and platform-specific services for easy interaction.
 
 ## Installation
 
 You can install the package via composer:
 
 ```bash
-composer require your-vendor/laravel-social-connect
+composer require jerry4rahul/laravel-social-connect
 ```
 
 Next, publish the configuration file:
 
 ```bash
-php artisan vendor:publish --provider="VendorName\SocialConnect\SocialConnectServiceProvider" --tag="config"
+php artisan vendor:publish --provider="Jerry4Rahul\SocialConnect\SocialConnectServiceProvider" --tag="config"
 ```
 
 This will create a `config/social-connect.php` file. **There are no migrations to run.**
@@ -52,8 +52,8 @@ return [
             "graph_version" => "v19.0",
             "scopes" => [/* Required permissions */],
             "services" => [
-                "auth" => VendorName\SocialConnect\Services\Facebook\FacebookService::class,
-                "publisher" => VendorName\SocialConnect\Services\Facebook\FacebookPublishingService::class,
+                "auth" => Jerry4Rahul\SocialConnect\Services\Facebook\FacebookService::class,
+                "publisher" => Jerry4Rahul\SocialConnect\Services\Facebook\FacebookPublishingService::class,
                 // ... other services
             ],
         ],
@@ -117,76 +117,80 @@ Since this package is stateless, you need to manage the authentication flow and 
 
 ### 1. Authentication Flow (Conceptual)
 
-*   **Step 1: Redirect to Provider:** Use the `authenticator` service to get the redirect URL.
-    ```php
-    use VendorName\SocialConnect\Facades\SocialConnect; // Assuming you create a Facade
-    // Or use dependency injection: app(VendorName\SocialConnect\SocialConnectManager::class)
+- **Step 1: Redirect to Provider:** Use the `authenticator` service to get the redirect URL.
 
-    public function redirectToFacebook()
-    {
-        $authUrl = SocialConnect::authenticator("facebook")->getAuthenticationUrl(["email", "pages_show_list"]);
-        return redirect($authUrl);
-    }
-    ```
-*   **Step 2: Handle Callback:** The user is redirected back to your specified `redirect_uri`. Exchange the received code for an access token.
-    ```php
-    use Illuminate\Http\Request;
+  ```php
+  use Jerry4Rahul\SocialConnect\Facades\SocialConnect; // Assuming you create a Facade
+  // Or use dependency injection: app(Jerry4Rahul\SocialConnect\SocialConnectManager::class)
 
-    public function handleFacebookCallback(Request $request)
-    {
-        $code = $request->input("code");
-        if (!$code) {
-            // Handle error: Authorization denied
-            return redirect("/home")->withErrors("Facebook authorization failed.");
-        }
+  public function redirectToFacebook()
+  {
+      $authUrl = SocialConnect::authenticator("facebook")->getAuthenticationUrl(["email", "pages_show_list"]);
+      return redirect($authUrl);
+  }
+  ```
 
-        try {
-            $tokenData = SocialConnect::authenticator("facebook")->getAccessToken($code);
-            // $tokenData will contain keys like "access_token", "expires_in", "refresh_token" (if applicable)
+- **Step 2: Handle Callback:** The user is redirected back to your specified `redirect_uri`. Exchange the received code for an access token.
 
-            // !!! YOUR RESPONSIBILITY !!!
-            // Store the $tokenData securely, associating it with your user and the platform.
-            // Example: Create or update your own `UserSocialTokens` model.
-            // $user->socialTokens()->updateOrCreate([
-            //     "platform" => "facebook",
-            // ], [
-            //     "access_token" => $tokenData["access_token"],
-            //     "refresh_token" => $tokenData["refresh_token"] ?? null,
-            //     "expires_at" => now()->addSeconds($tokenData["expires_in"] ?? 3600),
-            //     "scopes" => $tokenData["scopes"] ?? [], // Store granted scopes
-            // ]);
+  ```php
+  use Illuminate\Http\Request;
 
-            // Optionally, fetch basic user profile info immediately
-            $profile = SocialConnect::authenticator("facebook")->getUserProfile($tokenData["access_token"]);
-            // Store profile info as needed (e.g., platform user ID, name, email)
+  public function handleFacebookCallback(Request $request)
+  {
+      $code = $request->input("code");
+      if (!$code) {
+          // Handle error: Authorization denied
+          return redirect("/home")->withErrors("Facebook authorization failed.");
+      }
 
-            return redirect("/home")->with("success", "Facebook account connected!");
+      try {
+          $tokenData = SocialConnect::authenticator("facebook")->getAccessToken($code);
+          // $tokenData will contain keys like "access_token", "expires_in", "refresh_token" (if applicable)
 
-        } catch (\Exception $e) {
-            // Log the error
-            Log::error("Facebook token exchange failed: " . $e->getMessage());
-            return redirect("/home")->withErrors("Failed to connect Facebook account.");
-        }
-    }
-    ```
-*   **Step 3: Token Refresh (Where Applicable):** For platforms with refresh tokens (like Google/YouTube, LinkedIn, potentially Facebook), you need to implement logic to refresh the access token when it expires using the stored refresh token.
-    ```php
-    // Conceptual - within your application logic where you retrieve the token
-    // $storedToken = // Get stored token data for the user/platform
-    // if (now()->gte($storedToken->expires_at->subMinutes(5))) { // Check if expired or close to expiry
-    //     try {
-    //         $newTokenData = SocialConnect::authenticator("youtube")->refreshAccessToken($storedToken->refresh_token);
-    //         // !!! YOUR RESPONSIBILITY !!!
-    //         // Update the stored token data with new access_token and expires_at
-    //         // $storedToken->update([...]);
-    //         $accessToken = $newTokenData["access_token"];
-    //     } catch (\Exception $e) {
-    //         // Handle refresh failure - user might need to re-authenticate
-    //     }
-    // } else {
-    //     $accessToken = $storedToken->access_token;
-    // }
-    ```
+          // !!! YOUR RESPONSIBILITY !!!
+          // Store the $tokenData securely, associating it with your user and the platform.
+          // Example: Create or update your own `UserSocialTokens` model.
+          // $user->socialTokens()->updateOrCreate([
+          //     "platform" => "facebook",
+          // ], [
+          //     "access_token" => $tokenData["access_token"],
+          //     "refresh_token" => $tokenData["refresh_token"] ?? null,
+          //     "expires_at" => now()->addSeconds($tokenData["expires_in"] ?? 3600),
+          //     "scopes" => $tokenData["scopes"] ?? [], // Store granted scopes
+          // ]);
+
+          // Optionally, fetch basic user profile info immediately
+          $profile = SocialConnect::authenticator("facebook")->getUserProfile($tokenData["access_token"]);
+          // Store profile info as needed (e.g., platform user ID, name, email)
+
+          return redirect("/home")->with("success", "Facebook account connected!");
+
+      } catch (\Exception $e) {
+          // Log the error
+          Log::error("Facebook token exchange failed: " . $e->getMessage());
+          return redirect("/home")->withErrors("Failed to connect Facebook account.");
+      }
+  }
+  ```
+
+- **Step 3: Token Refresh (Where Applicable):** For platforms with refresh tokens (like Google/YouTube, LinkedIn, potentially Facebook), you need to implement logic to refresh the access token when it expires using the stored refresh token.
+  ```php
+  // Conceptual - within your application logic where you retrieve the token
+  // $storedToken = // Get stored token data for the user/platform
+  // if (now()->gte($storedToken->expires_at->subMinutes(5))) { // Check if expired or close to expiry
+  //     try {
+  //         $newTokenData = SocialConnect::authenticator("youtube")->refreshAccessToken($storedToken->refresh_token);
+  //         // !!! YOUR RESPONSIBILITY !!!
+  //         // Update the stored token data with new access_token and expires_at
+  //         // $storedToken->update([...]);
+  //         $accessToken = $newTokenData["access_token"];
+  //     } catch (\Exception $e) {
+  //         // Handle refresh failure - user might need to re-authenticate
+  //     }
+  // } else {
+  //     $accessToken = $storedToken->access_token;
+  // }
+  ```
 
 ### 2. Making API Calls (Stateless)
 
@@ -195,7 +199,7 @@ Once you have a valid access token (stored and retrieved by your application), y
 **Example: Publishing a Post**
 
 ```php
-use VendorName\SocialConnect\Facades\SocialConnect;
+use Jerry4Rahul\SocialConnect\Facades\SocialConnect;
 
 public function publishToTwitter(Request $request)
 {
@@ -219,7 +223,7 @@ public function publishToTwitter(Request $request)
 
         return back()->with("success", "Tweet published successfully!");
 
-    } catch (\VendorName\SocialConnect\Exceptions\PublishingException $e) {
+    } catch (\Jerry4Rahul\SocialConnect\Exceptions\PublishingException $e) {
         Log::error("Twitter publishing failed: " . $e->getMessage());
         return back()->withErrors("Failed to publish tweet: " . $e->getMessage());
     } catch (\Exception $e) {
@@ -232,7 +236,7 @@ public function publishToTwitter(Request $request)
 **Example: Getting Account Metrics**
 
 ```php
-use VendorName\SocialConnect\Facades\SocialConnect;
+use Jerry4Rahul\SocialConnect\Facades\SocialConnect;
 
 public function getFacebookPageInsights()
 {
@@ -256,7 +260,7 @@ public function getFacebookPageInsights()
 
         return view("insights.facebook", ["insights" => $result]);
 
-    } catch (\VendorName\SocialConnect\Exceptions\MetricsException $e) {
+    } catch (\Jerry4Rahul\SocialConnect\Exceptions\MetricsException $e) {
         Log::error("Facebook metrics retrieval failed: " . $e->getMessage());
         return back()->withErrors("Failed to retrieve Facebook insights: " . $e->getMessage());
     }
@@ -266,7 +270,7 @@ public function getFacebookPageInsights()
 **Example: Getting Comments**
 
 ```php
-use VendorName\SocialConnect\Facades\SocialConnect;
+use Jerry4Rahul\SocialConnect\Facades\SocialConnect;
 
 public function getYouTubeVideoComments($videoId)
 {
@@ -286,7 +290,7 @@ public function getYouTubeVideoComments($videoId)
 
         return view("comments.youtube", ["commentsData" => $result]);
 
-    } catch (\VendorName\SocialConnect\Exceptions\CommentException $e) {
+    } catch (\Jerry4Rahul\SocialConnect\Exceptions\CommentException $e) {
         Log::error("YouTube comment retrieval failed: " . $e->getMessage());
         return back()->withErrors("Failed to retrieve YouTube comments: " . $e->getMessage());
     }
@@ -297,11 +301,11 @@ public function getYouTubeVideoComments($videoId)
 
 You can access the specific service for each platform using the `SocialConnectManager`:
 
-*   `SocialConnect::authenticator(string $platform)`: Handles authentication URLs, token exchange, token refresh, user profile retrieval.
-*   `SocialConnect::publisher(string $platform)`: Handles publishing text, images, videos, links; deleting posts.
-*   `SocialConnect::metrics(string $platform)`: Handles retrieving account and post metrics, audience data, historical trends.
-*   `SocialConnect::messenger(string $platform)`: Handles retrieving conversations/messages, sending messages/replies.
-*   `SocialConnect::commenter(string $platform)`: Handles retrieving comments/replies, posting comments/replies, reacting, moderating.
+- `SocialConnect::authenticator(string $platform)`: Handles authentication URLs, token exchange, token refresh, user profile retrieval.
+- `SocialConnect::publisher(string $platform)`: Handles publishing text, images, videos, links; deleting posts.
+- `SocialConnect::metrics(string $platform)`: Handles retrieving account and post metrics, audience data, historical trends.
+- `SocialConnect::messenger(string $platform)`: Handles retrieving conversations/messages, sending messages/replies.
+- `SocialConnect::commenter(string $platform)`: Handles retrieving comments/replies, posting comments/replies, reacting, moderating.
 
 Refer to the specific service class implementations and the contracts (`PublishableInterface`, `MetricsInterface`, etc.) for detailed method signatures and expected parameters (including access tokens).
 
@@ -309,12 +313,12 @@ Refer to the specific service class implementations and the contracts (`Publisha
 
 Each service method returns an array containing relevant data. Key fields often include:
 
-*   `platform`: The name of the social platform (e.g., `facebook`).
-*   `platform_post_id`, `platform_comment_id`, `platform_message_id`: The unique ID assigned by the social platform.
-*   `metrics`: An array containing the requested metrics data, often keyed by metric name and potentially date or dimension.
-*   `comments`, `messages`, `conversations`: Arrays of structured data representing the retrieved items.
-*   `next_cursor`: A pagination token to use for fetching the next page of results (if available).
-*   `raw_response`: The original, unprocessed response object from the underlying SDK or API call (useful for debugging or accessing data not explicitly formatted by the package).
+- `platform`: The name of the social platform (e.g., `facebook`).
+- `platform_post_id`, `platform_comment_id`, `platform_message_id`: The unique ID assigned by the social platform.
+- `metrics`: An array containing the requested metrics data, often keyed by metric name and potentially date or dimension.
+- `comments`, `messages`, `conversations`: Arrays of structured data representing the retrieved items.
+- `next_cursor`: A pagination token to use for fetching the next page of results (if available).
+- `raw_response`: The original, unprocessed response object from the underlying SDK or API call (useful for debugging or accessing data not explicitly formatted by the package).
 
 It is your application's responsibility to parse and store the relevant information from these returned arrays.
 
@@ -324,10 +328,10 @@ The package throws specific exceptions for different types of errors (e.g., `Aut
 
 Common errors include:
 
-*   Invalid or expired access tokens (may require token refresh or user re-authentication).
-*   Insufficient permissions (ensure you request the correct scopes during authentication).
-*   API rate limits.
-*   Platform-specific errors (e.g., content policy violations, invalid post formats).
+- Invalid or expired access tokens (may require token refresh or user re-authentication).
+- Insufficient permissions (ensure you request the correct scopes during authentication).
+- API rate limits.
+- Platform-specific errors (e.g., content policy violations, invalid post formats).
 
 Check the exception message for details provided by the underlying API or SDK.
 
@@ -341,10 +345,8 @@ Please review our security policy on how to report security vulnerabilities.
 
 ## Credits
 
-*   [Your Name / Company](link-to-your-profile)
-*   All Contributors
+- [Rahul Kumar Sharma](https://www.linkedin.com/in/jerry4rahul/)
 
 ## License
 
 The MIT License (MIT). Please see [License File](LICENSE.md) for more information.
-

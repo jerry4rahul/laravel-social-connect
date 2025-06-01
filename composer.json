@@ -16,8 +16,8 @@
   "license": "MIT",
   "authors": [
     {
-      "name": "Your Name or Company Name",
-      "email": "your@email.com"
+      "name": "Rahul Kumar Sharma",
+      "email": "jerry.rahul2@gmail.com"
     }
   ],
   "require": {
@@ -31,13 +31,13 @@
   },
   "autoload": {
     "psr-4": {
-      "VendorName\\SocialConnect\\": "src/"
+      "Jerry4Rahul\\SocialConnect\\": "src/"
     }
   },
   "extra": {
     "laravel": {
       "providers": [
-        "VendorName\\SocialConnect\\SocialConnectServiceProvider"
+        "Jerry4Rahul\\SocialConnect\\SocialConnectServiceProvider"
       ]
     }
   },
