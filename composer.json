@@ -1,40 +1,49 @@
 {
-    "name": "your-vendor/laravel-social-connect",
-    "description": "Stateless Laravel package for social media integration (Facebook, Instagram, Twitter/X, LinkedIn, YouTube).",
-    "keywords": ["laravel", "social media", "api", "facebook", "instagram", "twitter", "linkedin", "youtube", "stateless"],
-    "type": "library",
-    "license": "MIT",
-    "authors": [
-        {
-            "name": "Your Name or Company Name",
-            "email": "your@email.com"
-        }
-    ],
-    "require": {
-        "php": "^8.2",
-        "laravel/framework": "^9.0|^10.0|^11.0|^12.0",
-        "guzzlehttp/guzzle": "^7.0",
-        "league/oauth1-client": "^1.10",
-        "league/oauth2-client": "^2.6",
-        "google/apiclient": "^2.15",
-        "abraham/twitteroauth": "^5.0" 
-    },
-    "autoload": {
-        "psr-4": {
-            "VendorName\\SocialConnect\\": "src/"
-        }
-    },
-    "extra": {
-        "laravel": {
-            "providers": [
-                "VendorName\\SocialConnect\\SocialConnectServiceProvider"
-            ]
-        }
-    },
-    "config": {
-        "sort-packages": true
-    },
-    "minimum-stability": "dev",
-    "prefer-stable": true
+  "name": "jerry4rahul/laravel-social-connect",
+  "description": "Stateless Laravel package for social media integration (Facebook, Instagram, Twitter/X, LinkedIn, YouTube).",
+  "keywords": [
+    "laravel",
+    "social media",
+    "api",
+    "facebook",
+    "instagram",
+    "twitter",
+    "linkedin",
+    "youtube",
+    "stateless"
+  ],
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Your Name or Company Name",
+      "email": "your@email.com"
+    }
+  ],
+  "require": {
+    "php": "^8.2",
+    "laravel/framework": "^9.0|^10.0|^11.0|^12.0",
+    "guzzlehttp/guzzle": "^7.0",
+    "league/oauth1-client": "^1.10",
+    "league/oauth2-client": "^2.6",
+    "google/apiclient": "^2.15",
+    "abraham/twitteroauth": "^5.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "VendorName\\SocialConnect\\": "src/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "VendorName\\SocialConnect\\SocialConnectServiceProvider"
+      ]
+    }
+  },
+  "config": {
+    "sort-packages": true
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
 }
-
